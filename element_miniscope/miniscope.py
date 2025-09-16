@@ -137,7 +137,7 @@ class AcquisitionSoftware(dj.Lookup):
     definition = """
     acq_software: varchar(24)
     """
-    contents = zip(["Miniscope-DAQ-V3", "Miniscope-DAQ-V4", "Inscopix"])
+    contents = zip(["Miniscope-DAQ-V3", "Miniscope-DAQ-V4", "Inscopix", "Bonsai"])
 
 
 @schema
@@ -353,6 +353,17 @@ class RecordingInfo(dj.Imported):
             px_height = metadata["microscope"]["fov"]["height"]
             px_width = metadata["microscope"]["fov"]["width"]
 
+        elif acq_software == "Bonsai":
+            logger.warning(f"Limited support for Bonsai recordings. Metadata will be extracted directly from the `.avi` files. To improve support, please contact the developers or open an issue on the GitHub repository.")
+
+            miniscope_video = cv2.VideoCapture(recording_filepaths[0])
+
+            nchannels = 1
+            nframes = int(miniscope_video.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = miniscope_video.get(cv2.CAP_PROP_FPS)
+            px_height = int(miniscope_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            px_width = int(miniscope_video.get(cv2.CAP_PROP_FRAME_WIDTH))
+
         else:
             raise NotImplementedError(
                 f"Loading routine not implemented for {acq_software}"
@@ -415,7 +426,7 @@ class ProcessingMethod(dj.Lookup):
     processing_method_desc: varchar(1000)
     """
 
-    contents = [("caiman", "caiman analysis suite")]
+    contents = [("caiman")]
 
 
 @schema
