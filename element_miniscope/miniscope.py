@@ -426,7 +426,7 @@ class ProcessingMethod(dj.Lookup):
     processing_method_desc: varchar(1000)
     """
 
-    contents = [("caiman")]
+    contents = zip(["caiman"])
 
 
 @schema
