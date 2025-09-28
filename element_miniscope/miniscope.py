@@ -659,15 +659,24 @@ class Processing(dj.Computed):
         file: filepath@miniscope-processed
         """
 
-    def make(self, key):
+    def make_fetch(self, key):
+        task_mode, output_dir = (ProcessingTask & key).fetch1(
+            "task_mode", "processing_output_dir"
+        )
+        method = (ProcessingParamSet & key).fetch1("processing_method")
+        avi_files = (Recording * RecordingInfo * RecordingInfo.File & key).fetch("file_path")
+        params = (ProcessingParamSet & key).fetch1("params")
+        sampling_rate = (RecordingInfo & key).fetch1("fps")
+        
+        return task_mode, output_dir, method, avi_files, params, sampling_rate
+
+
+    def make(self, key, task_mode, output_dir, method, avi_files, params, sampling_rate):
         """
         Execute the miniscope analysis defined by the ProcessingTask.
         - task_mode: 'load', confirm that the results are already computed.
         - task_mode: 'trigger' runs the analysis.
         """
-        task_mode, output_dir = (ProcessingTask & key).fetch1(
-            "task_mode", "processing_output_dir"
-        )
 
         if not output_dir:
             output_dir = ProcessingTask.infer_output_dir(key, relative=True, mkdir=True)
@@ -695,10 +704,6 @@ class Processing(dj.Computed):
                     f"Loading of {method} data is not yet supported"
                 )
         elif task_mode == "trigger":
-            method = (
-                ProcessingTask * ProcessingParamSet * ProcessingMethod * Recording & key
-            ).fetch1("processing_method")
-
             if method == "caiman":
                 import caiman
                 from element_interface.run_caiman import run_caiman
@@ -710,11 +715,6 @@ class Processing(dj.Computed):
                     find_full_path(get_miniscope_root_data_dir(), avi_file).as_posix()
                     for avi_file in avi_files
                 ]
-
-                params = (ProcessingTask * ProcessingParamSet & key).fetch1("params")
-                sampling_rate = (
-                    ProcessingTask * Recording * RecordingInfo & key
-                ).fetch1("fps")
 
                 run_caiman(
                     file_paths=avi_files,
@@ -735,13 +735,15 @@ class Processing(dj.Computed):
                 )
         else:
             raise ValueError(f"Unknown task mode: {task_mode}")
+        return output_dir
 
+    def make_insert(self, key, output_dir):
         self.insert1(key)
         self.File.insert(
             [
                 {
                     **key,
-                    "file_name": f.relative_to(output_dir).as_posix(),
+                    "file_name": f.relative_to(get_processed_root_data_dir()).as_posix(),
                     "file": f,
                 }
                 for f in output_dir.rglob("*")
