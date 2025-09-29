@@ -671,7 +671,7 @@ class Processing(dj.Computed):
         return task_mode, output_dir, method, avi_files, params, sampling_rate
 
 
-    def make(self, key, task_mode, output_dir, method, avi_files, params, sampling_rate):
+    def make_compute(self, key, task_mode, output_dir, method, avi_files, params, sampling_rate):
         """
         Execute the miniscope analysis defined by the ProcessingTask.
         - task_mode: 'load', confirm that the results are already computed.
