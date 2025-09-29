@@ -668,7 +668,7 @@ class Processing(dj.Computed):
         params = (ProcessingParamSet & key).fetch1("params")
         sampling_rate = (RecordingInfo & key).fetch1("fps")
         
-        return task_mode, output_dir, method, avi_files, params, sampling_rate
+        return (task_mode, output_dir, method, avi_files, params, sampling_rate)
 
 
     def make_compute(self, key, task_mode, output_dir, method, avi_files, params, sampling_rate):
