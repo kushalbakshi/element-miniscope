@@ -79,7 +79,7 @@ class MiniscopeMaskOverlayPlots(dj.Computed):
         """
 
     def make_fetch(self, key):
-        image_dims = (miniscope.RecordingInfo.Field & key).fetch1("px_height", "px_width")
+        image_dims = (miniscope.RecordingInfo & key).fetch1("px_height", "px_width")
         corr_img = (miniscope.MotionCorrection.Summary & key).fetch1("correlation_image")
         roi_data = (miniscope.Segmentation.Mask & key).fetch(
             "mask", "mask_xpix", "mask_ypix", "mask_weights", 
