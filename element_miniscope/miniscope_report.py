@@ -128,7 +128,7 @@ class MiniscopeMaskOverlayPlots(dj.Computed):
             plt.close(fig)
             
             image_by_roi_overlays_files.append(filepath)
-            part_inserts.append({**key, "mask": mask_id, "image_by_roi_png": filepath})
+            part_inserts.append({**key, "fluorescence_channel": 0, "mask": mask_id, "image_by_roi_png": filepath})
         
         return correlation_image_overlay_file, part_inserts, tmpdir
     
