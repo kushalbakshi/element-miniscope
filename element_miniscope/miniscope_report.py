@@ -85,7 +85,7 @@ class MiniscopeMaskOverlayPlots(dj.Computed):
             "mask", "mask_xpix", "mask_ypix", "mask_weights", 
             as_dict=True, order_by="mask ASC"
         )
-        fluorescence_traces = (miniscope.Fluorescence.Trace & key & "fluo_channel=0").fetch(
+        fluorescence_traces = (miniscope.Fluorescence.Trace & key & "fluorescence_channel=0").fetch(
             "fluorescence", order_by="mask ASC"
         )
         return image_dims, corr_img, roi_data, fluorescence_traces
