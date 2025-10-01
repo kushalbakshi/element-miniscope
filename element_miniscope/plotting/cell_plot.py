@@ -1,122 +1,121 @@
-import colorsys
+import matplotlib.pyplot as plt
 import numpy as np
-import plotly.graph_objects as go
+from skimage.measure import find_contours
 
 
-def plot_cell_overlayed_image(
-    miniscope_module,
-    segmentation_key,
-    fig_height=600,
-    fig_width=600,
-    mask_saturation=0.7,
-    mask_color_value=1,
-    **kwargs,
-) -> go.Figure:
-    """Generate a Plotly figure with an overlayed summary image and ROI masks."""
+def plot_all_rois(correlation_image, roi_contours, figsize=(10, 8), seed=42):
+    """Optimized version that uses pre-computed contours"""
+    np.random.seed(seed)
+    colors = [np.maximum(np.random.rand(3), 0.3) for _ in range(len(roi_contours))]
+    
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.imshow(correlation_image, cmap="viridis", aspect="equal")
+    ax.set_title("All ROI Contours on Correlation Image", fontsize=14, fontweight="bold")
+    
+    for color, contours in zip(colors, roi_contours):
+        if contours is not None:
+            for contour in contours:
+                ax.plot(contour[:, 0], contour[:, 1], color=color, linewidth=2, alpha=0.8)
+    
+    ax.set_xlim(0, correlation_image.shape[1])
+    ax.set_ylim(correlation_image.shape[0], 0)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    plt.tight_layout()
+    return fig
 
-    # Fetch data
-    average_image, max_projection_image, mask_ids, mask_xpix, mask_ypix, _ = (
-        figure_data(miniscope_module, segmentation_key)
+def plot_highlighted_roi(correlation_image, roi_contours, fluorescence_traces,
+                                    roi_to_highlight, roi_id, figsize=(12, 8)):
+    """Optimized version that uses pre-computed contours"""
+    fig, (ax_spatial, ax_trace) = plt.subplots(
+        2, 1, figsize=figsize, gridspec_kw={"height_ratios": [2, 1]}
     )
-
-    average_image = normalize_image(average_image, **kwargs)
-    max_projection_image = normalize_image(max_projection_image, **kwargs)
-
-    # Generate random HSV colors and convert to RGB
-    roi_hsv_colors = [np.random.rand() for _ in range(mask_ids.size)]
-    roi_rgb_colors = [
-        f"rgb{tuple(int(c * 255) for c in colorsys.hsv_to_rgb(hue, mask_saturation, mask_color_value))}"
-        for hue in roi_hsv_colors
-    ]
-
-    fig = go.Figure()
-
-    # Use `go.Heatmap()` instead of `go.Image()` for better JSON handling
-    fig.add_trace(go.Heatmap(z=average_image, colorscale="gray", showscale=False))
-
-    for xpix, ypix, color, roi_id in zip(
-        mask_xpix, mask_ypix, roi_rgb_colors, mask_ids
-    ):
-        fig.add_trace(
-            go.Scatter(
-                x=xpix,
-                y=ypix,
-                mode="lines",
-                line=dict(color=color, width=2),
-                name=f"ROI {roi_id}",
-                hoverinfo="text",
-                text=[f"ROI {roi_id}"] * len(xpix),
-                showlegend=False,
-                opacity=0.5,
-            )
-        )
-
-    # Update layout
-    fig.update_layout(
-        title=dict(
-            text="Summary Image",
-            x=0.5,
-            xanchor="center",
-            font=dict(size=18),
-        ),
-        updatemenus=[
-            {
-                "buttons": [
-                    {
-                        "label": "Average Image",
-                        "method": "update",
-                        "args": [{"z": [average_image]}],
-                    },
-                    {
-                        "label": "Max Projection Image",
-                        "method": "update",
-                        "args": [{"z": [max_projection_image]}],
-                    },
-                ],
-                "direction": "down",
-                "showactive": True,
-                "x": 0.5,
-                "xanchor": "center",
-                "y": 1.1,
-            }
-        ],
-        height=fig_height,
-        width=fig_width,
-        margin=dict(t=fig_height / 6, b=40),
-    )
-
+    
+    # Spatial plot
+    ax_spatial.imshow(correlation_image, cmap="viridis", aspect="equal")
+    ax_spatial.set_title(f"ROI {roi_id} Highlighted", fontsize=14, fontweight="bold")
+    
+    for idx, contours in enumerate(roi_contours):
+        if contours is not None:
+            color = "red" if idx == roi_to_highlight else "gray"
+            linewidth = 3 if idx == roi_to_highlight else 1.5
+            alpha = 1.0 if idx == roi_to_highlight else 0.7
+            
+            for contour in contours:
+                ax_spatial.plot(contour[:, 0], contour[:, 1], 
+                                color=color, linewidth=linewidth, alpha=alpha)
+    
+    ax_spatial.set_xlim(0, correlation_image.shape[1])
+    ax_spatial.set_ylim(correlation_image.shape[0], 0)
+    ax_spatial.set_xticks([])
+    ax_spatial.set_yticks([])
+    
+    # Fluorescence trace
+    if roi_to_highlight < len(fluorescence_traces):
+        trace_data = fluorescence_traces[roi_to_highlight]
+        timepoints = np.arange(len(trace_data))
+        ax_trace.plot(timepoints, trace_data, color="red", linewidth=2)
+        ax_trace.set_xlabel("Frame #", fontsize=12)
+        ax_trace.set_ylabel("Fluorescence", fontsize=12)
+        ax_trace.set_title(f"ROI {roi_id} Fluorescence Trace", fontsize=14, fontweight="bold")
+        ax_trace.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
     return fig
 
 
-def figure_data(miniscope_module, segmentation_key):
-    """Fetch data for generating a figure."""
-    average_image = np.squeeze(
-        (miniscope_module.MotionCorrection.Summary & segmentation_key).fetch1(
-            "average_image"
-        )
-    )
-    max_projection_image = np.squeeze(
-        (miniscope_module.MotionCorrection.Summary & segmentation_key).fetch1(
-            "max_proj_image"
-        )
-    )
-    mask_ids, mask_xpix, mask_ypix, mask_weights = (
-        miniscope_module.Segmentation.Mask & segmentation_key
-    ).fetch("mask", "mask_xpix", "mask_ypix", "mask_weights")
+def get_roi_contours_from_pixels(roi_data, d1, d2, thr=0.99):
+    """
+    Convert ROI pixel data to contours (same logic as before)
+    """
 
-    return (
-        average_image,
-        max_projection_image,
-        mask_ids,
-        mask_xpix,
-        mask_ypix,
-        mask_weights,
-    )
+    x_pix = roi_data["mask_xpix"]
+    y_pix = roi_data["mask_ypix"]
 
+    # Get weights
+    if roi_data["mask_weights"] is not None:
+        weights = roi_data["mask_weights"]
+    else:
+        weights = np.ones(len(x_pix))
 
-def normalize_image(image, low_q=0, high_q=1):
-    """Normalize image to [0,1] based on quantile clipping."""
-    q_min, q_max = np.quantile(image, [low_q, high_q])
-    image = np.clip(image, q_min, q_max)
+    # Create sparse representation
+    total_pixels = d1 * d2
+    A_component = np.zeros(total_pixels)
 
-    return ((image - q_min) / (q_max - q_min) * 255).astype(np.uint8)
+    # Convert 2D coordinates to linear indices
+    linear_indices = y_pix + x_pix * d1
+
+    # Handle potential out-of-bounds indices
+    valid_mask = (linear_indices >= 0) & (linear_indices < total_pixels)
+    linear_indices = linear_indices[valid_mask]
+    weights = weights[valid_mask]
+
+    if len(linear_indices) == 0:
+        return None
+
+    # Set weights in the component vector
+    A_component[linear_indices] = weights
+
+    # Apply energy thresholding
+    patch_data = A_component[A_component > 0]
+    if len(patch_data) == 0:
+        return None
+
+    indx = np.argsort(patch_data)[::-1]
+    cumEn = np.cumsum(patch_data[indx] ** 2)
+    cumEn /= cumEn[-1]
+
+    # Create thresholded version
+    Bvec = np.ones(len(A_component))
+    indices = np.where(A_component > 0)[0]
+    Bvec[indices[indx]] = cumEn
+    Bmat = Bvec.reshape((d1, d2), order="F")
+
+    # Find contours
+    try:
+        vertices = find_contours(Bmat.T, thr)
+        if len(vertices) == 0:
+            return None
+        return vertices
+    except:
+        return None

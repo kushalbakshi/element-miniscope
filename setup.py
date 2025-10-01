@@ -31,7 +31,7 @@ setup(
         "ipywidgets",
         "plotly",
         "opencv-python",
-        "element-interface @ git+https://github.com/datajoint/element-interface.git",
+        "element-interface @ git+https://github.com/kushalbakshi/element-interface.git",
     ],
     extras_require={
         "elements": [
