@@ -63,19 +63,19 @@ class QualityMetrics(dj.Imported):
 
 
 @schema
-class MiniscopeMaskOverlayPlots(dj.Computed):
+class MiniscopeOverlayPlots(dj.Computed):
     definition = """
     -> miniscope.Fluorescence
     ---
-    miniscope_summary_image_with_rois: attach  # ROIs overlayed on correlation image
+    summary_image_all_rois: attach  # ROIs overlayed on correlation image
     """
 
-    class MiniscopeSummaryImageByRoi(dj.Part):
+    class SummaryImageByRoi(dj.Part):
         definition = """
         -> master
         -> miniscope.Fluorescence.Trace
         ---
-        miniscope_image_by_roi_png: attach  # ROIs overlayed on correlation image
+        summary_image_by_roi_png: attach  # ROIs overlayed on correlation image
         """
 
     def make_fetch(self, key):
