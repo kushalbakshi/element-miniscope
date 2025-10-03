@@ -722,7 +722,7 @@ class Processing(dj.Computed):
                 for avi_file in avi_files
             ]
             params["fnames"] = avi_files
-            params["fps"] = sampling_rate
+            params["fr"] = sampling_rate
             params["is3D"] = False
             @memoized_result(
                 uniqueness_dict=params,
@@ -802,18 +802,18 @@ class Processing(dj.Computed):
                     cnm.estimates.evaluate_components(images, cnm.params, dview=cnm.dview)
                     cnm.estimates.detrend_df_f(quantileMin=8, frames_window=250)
                     logger.info("Computing summary images...")
-                    Cn = cm.summary_images.local_correlations(
-                        images[:: max(T // 1000, 1)], swap_dim=False
+                    correlation_image, _ = cm.summary_images.correlation_pnr(
+                        images[:: max(T // 1000, 1)], gSig=cnm.params.init["gSig"], swap_dim=False
                     )
-                    Cn[np.isnan(Cn)] = 0
-                    cnm.estimates.Cn = Cn
+                    correlation_image[np.isnan(correlation_image)] = 0
+                    cnm.estimates.Cn = correlation_image
                     fname_hdf5 = cnm.mmap_file[:-4] + "hdf5"
                     cnm.save(fname_hdf5)
                     cnmf_output_file = pathlib.Path(fname_hdf5)
                     summary_images = {
                         "average_image": np.mean(images[:: max(T // 1000, 1)], axis=0),
                         "max_image": np.max(images[:: max(T // 1000, 1)], axis=0),
-                        "correlation_image": Cn,
+                        "correlation_image": correlation_image,
                     }
                     _save_mc(
                         mc,
