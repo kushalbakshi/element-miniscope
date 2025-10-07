@@ -861,7 +861,7 @@ class Processing(dj.Computed):
                 {
                     **key,
                     "file_name": f.relative_to(get_processed_root_data_dir()).as_posix(),
-                    "file": f,
+                    "file": f.as_posix(),
                 }
                 for f in output_dir.rglob("*")
                 if f.is_file()
