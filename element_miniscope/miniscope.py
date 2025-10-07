@@ -11,7 +11,7 @@ from typing import Union
 import datajoint as dj
 import numpy as np
 import pandas as pd
-from element_interface.utils import dict_to_uuid, find_full_path, find_root_directory
+from element_interface.utils import dict_to_uuid, find_full_path, find_root_directory, memoized_result
 
 logger = dj.logger
 
