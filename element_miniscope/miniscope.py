@@ -850,14 +850,7 @@ class Processing(dj.Computed):
             caiman_dataset = imaging_dataset
             key["processing_time"] = caiman_dataset.creation_time
             key["package_version"] = cm.__version__
-        else:
-            raise ValueError(f"Unknown task mode: {task_mode}")
-        return output_dir
-
-    def make_insert(self, key, output_dir):
-        self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
-        self.File.insert(
-            [
+            file_entries = [
                 {
                     **key,
                     "file_name": f.relative_to(get_processed_root_data_dir()).as_posix(),
@@ -865,9 +858,14 @@ class Processing(dj.Computed):
                 }
                 for f in output_dir.rglob("*")
                 if f.is_file()
-            ],
-            ignore_extra_fields=True,
-        )
+            ]
+        else:
+            raise ValueError(f"Unknown task mode: {task_mode}")
+        return file_entries
+
+    def make_insert(self, key, file_entries):
+        self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
+        self.File.insert(file_entries, ignore_extra_fields=True)
 
 
 # Motion Correction --------------------------------------------------------------------
