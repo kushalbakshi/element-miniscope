@@ -5,7 +5,7 @@ import inspect
 import json
 import os
 import pathlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Union
 
 import datajoint as dj
@@ -855,7 +855,7 @@ class Processing(dj.Computed):
         return output_dir
 
     def make_insert(self, key, output_dir):
-        self.insert1(key)
+        self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
         self.File.insert(
             [
                 {
