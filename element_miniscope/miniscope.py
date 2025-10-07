@@ -336,9 +336,17 @@ class RecordingInfo(dj.Imported):
 
             nchannels = 1  # Assumes a single channel
             nframes = len(time_stamps) - 1
-            px_height = metadata["ROI"]["height"]
-            px_width = metadata["ROI"]["width"]
-            fps = int(metadata["frameRate"].replace("FPS", ""))
+            try:
+                px_height = metadata["ROI"]["height"]
+                px_width = metadata["ROI"]["width"]
+                fps = int(metadata["frameRate"].replace("FPS", ""))
+            except KeyError:
+                miniscope_video = cv2.VideoCapture(recording_filepaths[0])
+                px_height = int(miniscope_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                px_width = int(miniscope_video.get(cv2.CAP_PROP_FRAME_WIDTH))
+                fps = int(miniscope_video.get(cv2.CAP_PROP_FPS))
+                miniscope_video.release()
+
             time_stamps = np.array(time_stamps[1:], dtype=float)[:, 0]
 
         elif acq_software == "Inscopix":
