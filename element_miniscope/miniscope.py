@@ -861,7 +861,7 @@ class Processing(dj.Computed):
             ]
         else:
             raise ValueError(f"Unknown task mode: {task_mode}")
-        return (file_entries)
+        return file_entries,
 
     def make_insert(self, key, file_entries):
         self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
