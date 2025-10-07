@@ -861,11 +861,12 @@ class Processing(dj.Computed):
             ]
         else:
             raise ValueError(f"Unknown task mode: {task_mode}")
-        return file_entries
+        return (file_entries)
 
     def make_insert(self, key, file_entries):
         self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
-        self.File.insert(file_entries, ignore_extra_fields=True)
+        for file in file_entries:
+            self.File.insert1(file, ignore_extra_fields=True)
 
 
 # Motion Correction --------------------------------------------------------------------
