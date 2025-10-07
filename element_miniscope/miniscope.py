@@ -732,6 +732,10 @@ class Processing(dj.Computed):
             params["fnames"] = avi_files
             params["fr"] = sampling_rate
             params["is3D"] = False
+            if "indices" in params:
+                params["motion"] = {"indices": (slice(*params.get("indices")[0]), slice(*params.get("indices")[1]))}
+            else:
+                params["motion"] = {"indices": (slice(None), slice(None))}
             @memoized_result(
                 uniqueness_dict=params,
                 output_directory=output_dir,
