@@ -815,7 +815,7 @@ class Processing(dj.Computed):
                     cnm.estimates.detrend_df_f(quantileMin=8, frames_window=250)
                     logger.info("Computing summary images...")
                     correlation_image, _ = cm.summary_images.correlation_pnr(
-                        images[:: max(T // 1000, 1)], gSig=cnm.params.init["gSig"], swap_dim=False
+                        images[:: max(T // 1000, 1)], gSig=cnm.params.init["gSig"][0], swap_dim=False
                     )
                     correlation_image[np.isnan(correlation_image)] = 0
                     cnm.estimates.Cn = correlation_image
