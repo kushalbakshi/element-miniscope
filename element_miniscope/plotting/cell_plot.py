@@ -76,10 +76,6 @@ def plot_highlighted_roi(
         raise ValueError(
             "Individual ROI data must be a dictionary containing 'mask', 'mask_xpix', 'mask_ypix', 'mask_weights'"
         )
-    if not isinstance(fluorescence_traces, list):
-        raise ValueError("Fluorescence traces must be a list")
-    if not all(isinstance(trace, np.ndarray) for trace in fluorescence_traces):
-        raise ValueError("Fluorescence traces must be a list of numpy arrays")
 
     d1, d2 = summary_image.shape
     roi_contours = []
