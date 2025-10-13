@@ -127,6 +127,6 @@ class MiniscopeOverlayPlots(dj.Computed):
         return correlation_image_overlay_file, part_inserts, tmpdir
     
     def make_insert(self, key, correlation_image_overlay_file, part_inserts, tmpdir):
-        self.insert1({**key, "summary_image_with_rois": correlation_image_overlay_file})
+        self.insert1({**key, "summary_image_all_rois": correlation_image_overlay_file})
         self.SummaryImageByRoi.insert(part_inserts)
         tmpdir.cleanup()
