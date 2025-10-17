@@ -1,4 +1,5 @@
 import csv
+import copy
 import cv2
 import importlib
 import inspect
@@ -339,14 +340,12 @@ class RecordingInfo(dj.Imported):
             try:
                 px_height = metadata["ROI"]["height"]
                 px_width = metadata["ROI"]["width"]
-                fps = int(metadata["frameRate"].replace("FPS", ""))
             except KeyError:
                 miniscope_video = cv2.VideoCapture(recording_filepaths[0])
                 px_height = int(miniscope_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 px_width = int(miniscope_video.get(cv2.CAP_PROP_FRAME_WIDTH))
-                fps = int(miniscope_video.get(cv2.CAP_PROP_FPS))
                 miniscope_video.release()
-
+            fps = int(metadata["frameRate"].replace("FPS", ""))
             time_stamps = np.array(time_stamps[1:], dtype=float)[:, 0]
 
         elif acq_software == "Inscopix":
@@ -669,35 +668,34 @@ class Processing(dj.Computed):
         """
 
     def make_fetch(self, key):
-        task_mode, output_dir = (ProcessingTask & key).fetch1(
+        task_mode, processing_output_dir = (ProcessingTask & key).fetch1(
             "task_mode", "processing_output_dir"
         )
         method = (ProcessingParamSet & key).fetch1("processing_method")
         avi_files = (RecordingInfo.File & key).fetch("file_path")
-        params = (ProcessingParamSet & key).fetch1("params")
+        processing_params = (ProcessingParamSet & key).fetch1("params")
         sampling_rate = (RecordingInfo & key).fetch1("fps")
         
-        return (task_mode, output_dir, method, avi_files, params, sampling_rate)
+        return (task_mode, processing_output_dir, method, avi_files, processing_params, sampling_rate)
 
 
-    def make_compute(self, key, task_mode, output_dir, method, avi_files, params, sampling_rate):
+    def make_compute(self, key, task_mode, processing_output_dir, method, avi_files, processing_params, sampling_rate):
         """
         Execute the miniscope analysis defined by the ProcessingTask.
         - task_mode: 'load', confirm that the results are already computed.
         - task_mode: 'trigger' runs the analysis.
         """
-
         if method != "caiman":
             raise NotImplementedError(f"Method {method} is not supported")
+        
+        params = copy.deepcopy(processing_params)
 
-        if not output_dir:
+        if not processing_output_dir:
             output_dir = ProcessingTask.infer_output_dir(key, relative=True, mkdir=True)
-            # update processing_output_dir
-            ProcessingTask.update1(
-                {**key, "processing_output_dir": output_dir.as_posix()}
-            )
+        else:
+            output_dir = processing_output_dir
         try:
-            output_dir = find_full_path(get_miniscope_root_data_dir(), output_dir)
+            output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
         except FileNotFoundError as e:
             if task_mode == "trigger":
                 processed_dir = pathlib.Path(get_processed_root_data_dir())
@@ -861,9 +859,13 @@ class Processing(dj.Computed):
             ]
         else:
             raise ValueError(f"Unknown task mode: {task_mode}")
-        return file_entries,
+        return (file_entries, output_dir)
 
-    def make_insert(self, key, file_entries):
+    def make_insert(self, key, file_entries, output_dir):
+        # update processing_output_dir
+        ProcessingTask.update1(
+            {**key, "processing_output_dir": output_dir.relative_to(get_processed_root_data_dir()).as_posix()}
+        )
         self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
         for file in file_entries:
             self.File.insert1(file, ignore_extra_fields=True)
