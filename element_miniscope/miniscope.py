@@ -12,7 +12,12 @@ from typing import Union
 import datajoint as dj
 import numpy as np
 import pandas as pd
-from element_interface.utils import dict_to_uuid, find_full_path, find_root_directory, memoized_result
+from element_interface.utils import (
+    dict_to_uuid,
+    find_full_path,
+    find_root_directory,
+    memoized_result,
+)
 
 logger = dj.logger
 
@@ -362,7 +367,9 @@ class RecordingInfo(dj.Imported):
             px_width = metadata["microscope"]["fov"]["width"]
 
         elif acq_software == "Bonsai":
-            logger.warning(f"Limited support for Bonsai recordings. Metadata will be extracted directly from the `.avi` files. To improve support, please contact the developers or open an issue on the GitHub repository.")
+            logger.warning(
+                f"Limited support for Bonsai recordings. Metadata will be extracted directly from the `.avi` files. To improve support, please contact the developers or open an issue on the GitHub repository."
+            )
 
             miniscope_video = cv2.VideoCapture(recording_filepaths[0])
 
@@ -537,7 +544,7 @@ class ProcessingTask(dj.Manual):
     and the triggering of new analysis for all supported analysis methods.
 
     Attributes:
-        RecordingInfo (foreign key): Primary key from RecordingInfo.
+        Recording (foreign key): Primary key from Recording.
         ProcessingParamSet (foreign key): Primary key from ProcessingParamSet.
         processing_output_dir (str): Output directory of the processed scan relative to the root data directory.
         task_mode (str): One of 'load' (load computed analysis results) or 'trigger'
@@ -545,7 +552,7 @@ class ProcessingTask(dj.Manual):
     """
 
     definition = """# Manual table for defining a processing task ready to be run
-    -> RecordingInfo
+    -> Recording
     -> ProcessingParamSet
     ---
     processing_output_dir='': varchar(255)    # relative to the root data directory
@@ -667,6 +674,10 @@ class Processing(dj.Computed):
         file: filepath@miniscope-processed
         """
 
+    @property
+    def key_source(self):
+        return ProcessingTask & RecordingInfo
+
     def make_fetch(self, key):
         task_mode, processing_output_dir = (ProcessingTask & key).fetch1(
             "task_mode", "processing_output_dir"
@@ -675,11 +686,26 @@ class Processing(dj.Computed):
         avi_files = (RecordingInfo.File & key).fetch("file_path")
         processing_params = (ProcessingParamSet & key).fetch1("params")
         sampling_rate = (RecordingInfo & key).fetch1("fps")
-        
-        return (task_mode, processing_output_dir, method, avi_files, processing_params, sampling_rate)
 
+        return (
+            task_mode,
+            processing_output_dir,
+            method,
+            avi_files,
+            processing_params,
+            sampling_rate,
+        )
 
-    def make_compute(self, key, task_mode, processing_output_dir, method, avi_files, processing_params, sampling_rate):
+    def make_compute(
+        self,
+        key,
+        task_mode,
+        processing_output_dir,
+        method,
+        avi_files,
+        processing_params,
+        sampling_rate,
+    ):
         """
         Execute the miniscope analysis defined by the ProcessingTask.
         - task_mode: 'load', confirm that the results are already computed.
@@ -687,7 +713,7 @@ class Processing(dj.Computed):
         """
         if method != "caiman":
             raise NotImplementedError(f"Method {method} is not supported")
-        
+
         params = copy.deepcopy(processing_params)
 
         if not processing_output_dir:
@@ -731,9 +757,15 @@ class Processing(dj.Computed):
             params["fr"] = sampling_rate
             params["is3D"] = False
             if "indices" in params:
-                params["motion"] = {"indices": (slice(*params.get("indices")[0]), slice(*params.get("indices")[1]))}
+                params["motion"] = {
+                    "indices": (
+                        slice(*params.get("indices")[0]),
+                        slice(*params.get("indices")[1]),
+                    )
+                }
             else:
                 params["motion"] = {"indices": (slice(None), slice(None))}
+
             @memoized_result(
                 uniqueness_dict=params,
                 output_directory=output_dir,
@@ -778,16 +810,16 @@ class Processing(dj.Computed):
                             np.max(np.abs(mc.shifts_rig))
                         ).astype(int)
                         cnm.estimates.shifts = mc.shifts_rig
-                
+
                     base_name = pathlib.Path(fnames[0]).stem
                     fname_mc = (
-                        mc.fname_tot_els if cnm.params.motion["pw_rigid"] else mc.fname_tot_rig
+                        mc.fname_tot_els
+                        if cnm.params.motion["pw_rigid"]
+                        else mc.fname_tot_rig
                     )
                     if all(fname_mc):
                         logger.info("Generating C-order memmap file...")
-                        border_to_0 = (
-                            0 if mc.border_nan == "copy" else mc.border_to_0
-                        )
+                        border_to_0 = 0 if mc.border_nan == "copy" else mc.border_to_0
                         fname_new = cm.mmapping.save_memmap(
                             fname_mc,
                             base_name=base_name + "_mc",
@@ -796,7 +828,9 @@ class Processing(dj.Computed):
                             border_to_0=border_to_0,
                         )
                     else:
-                        logger.info("Applying shifts, then generating C-order memmap file...")
+                        logger.info(
+                            "Applying shifts, then generating C-order memmap file..."
+                        )
                         fname_new = mc.apply_shifts_movie(
                             fnames,
                             save_memmap=True,
@@ -809,11 +843,15 @@ class Processing(dj.Computed):
                     cnm.mmap_file = fname_new
                     logger.info("Starting CNMF analysis...")
                     cnm.fit(images, indices=(slice(None), slice(None)))
-                    cnm.estimates.evaluate_components(images, cnm.params, dview=cnm.dview)
+                    cnm.estimates.evaluate_components(
+                        images, cnm.params, dview=cnm.dview
+                    )
                     cnm.estimates.detrend_df_f(quantileMin=8, frames_window=250)
                     logger.info("Computing summary images...")
                     correlation_image, _ = cm.summary_images.correlation_pnr(
-                        images[:: max(T // 1000, 1)], gSig=cnm.params.init["gSig"][0], swap_dim=False
+                        images[:: max(T // 1000, 1)],
+                        gSig=cnm.params.init["gSig"][0],
+                        swap_dim=False,
                     )
                     correlation_image[np.isnan(correlation_image)] = 0
                     cnm.estimates.Cn = correlation_image
@@ -851,7 +889,9 @@ class Processing(dj.Computed):
             file_entries = [
                 {
                     **key,
-                    "file_name": f.relative_to(get_processed_root_data_dir()).as_posix(),
+                    "file_name": f.relative_to(
+                        get_processed_root_data_dir()
+                    ).as_posix(),
                     "file": f.as_posix(),
                 }
                 for f in output_dir.rglob("*")
@@ -864,7 +904,12 @@ class Processing(dj.Computed):
     def make_insert(self, key, file_entries, output_dir):
         # update processing_output_dir
         ProcessingTask.update1(
-            {**key, "processing_output_dir": output_dir.relative_to(get_processed_root_data_dir()).as_posix()}
+            {
+                **key,
+                "processing_output_dir": output_dir.relative_to(
+                    get_processed_root_data_dir()
+                ).as_posix(),
+            }
         )
         self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
         for file in file_entries:
