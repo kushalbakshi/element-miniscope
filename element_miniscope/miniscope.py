@@ -1500,7 +1500,7 @@ def get_loader_result(key, table) -> tuple:
         "processing_method", _table_attribute_mapper[table.__name__]
     )
 
-    output_dir = find_full_path(get_miniscope_root_data_dir(), output_dir)
+    output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
 
     if method == "caiman":
         from element_interface import caiman_loader
