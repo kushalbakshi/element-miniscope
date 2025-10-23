@@ -23,7 +23,7 @@ setup(
     license="MIT",
     url=f'https://github.com/datajoint/{pkg_name.replace("_", "-")}',
     keywords="neuroscience miniscope science datajoint",
-    packages=find_packages(exclude=["contrib", "docs", "tests*", "notebooks", "images"]),
+    packages=["element_miniscope", "element_miniscope.plotting"],
     scripts=[],
     install_requires=[
         "datajoint>=0.14.4",
