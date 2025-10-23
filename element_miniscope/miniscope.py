@@ -882,7 +882,7 @@ class Processing(dj.Computed):
                         del os.environ["CAIMAN_TEMP"]
 
             _run_processing()
-            _, imaging_dataset = get_loader_result(key, ProcessingTask)
+            _, imaging_dataset = get_loader_result(key, ProcessingTask, full_output_dir=output_dir)
             caiman_dataset = imaging_dataset
             key["processing_time"] = caiman_dataset.creation_time
             key["package_version"] = cm.__version__
@@ -1479,12 +1479,8 @@ class ProcessingQualityMetrics(dj.Computed):
 
 # Helper Functions ---------------------------------------------------------------------
 
-_table_attribute_mapper = {
-    "ProcessingTask": "processing_output_dir",
-}
 
-
-def get_loader_result(key, table) -> tuple:
+def get_loader_result(key, table, full_output_dir=None) -> tuple:
     """Retrieve the loaded processed imaging results from the loader (e.g. caiman, etc.)
 
     Args:
@@ -1496,12 +1492,12 @@ def get_loader_result(key, table) -> tuple:
         method, loaded_output (tuple): method string and loader object with results (e.g. caiman.CaImAn, etc.)
     """
 
-    method, output_dir = (ProcessingParamSet * table & key).fetch1(
-        "processing_method", _table_attribute_mapper[table.__name__]
-    )
-
-    output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
-
+    if full_output_dir is None:
+        output_dir = (ProcessingParamSet * table & key).fetch1(
+            "processing_output_dir"
+        )
+        output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
+    method = (ProcessingParamSet * table & key).fetch1("processing_method")
     if method == "caiman":
         from element_interface import caiman_loader
 
