@@ -23,15 +23,15 @@ setup(
     license="MIT",
     url=f'https://github.com/datajoint/{pkg_name.replace("_", "-")}',
     keywords="neuroscience miniscope science datajoint",
-    packages=find_packages(exclude=["contrib", "docs", "tests*"]),
+    packages=find_packages(exclude=["contrib", "docs", "tests*", "notebooks", "images"]),
     scripts=[],
     install_requires=[
-        "datajoint>=0.13.0",
+        "datajoint>=0.14.4",
         "ipykernel>=6.0.1",
         "ipywidgets",
         "plotly",
         "opencv-python",
-        "element-interface @ git+https://github.com/datajoint/element-interface.git",
+        "element-interface @ git+https://github.com/kushalbakshi/element-interface.git",
     ],
     extras_require={
         "elements": [

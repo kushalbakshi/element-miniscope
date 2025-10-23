@@ -1,16 +1,23 @@
 import csv
+import copy
 import cv2
 import importlib
 import inspect
 import json
+import os
 import pathlib
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Union
 
 import datajoint as dj
 import numpy as np
 import pandas as pd
-from element_interface.utils import dict_to_uuid, find_full_path, find_root_directory
+from element_interface.utils import (
+    dict_to_uuid,
+    find_full_path,
+    find_root_directory,
+    memoized_result,
+)
 
 logger = dj.logger
 
@@ -137,7 +144,7 @@ class AcquisitionSoftware(dj.Lookup):
     definition = """
     acq_software: varchar(24)
     """
-    contents = zip(["Miniscope-DAQ-V3", "Miniscope-DAQ-V4", "Inscopix"])
+    contents = zip(["Miniscope-DAQ-V3", "Miniscope-DAQ-V4", "Inscopix", "Bonsai"])
 
 
 @schema
@@ -335,8 +342,14 @@ class RecordingInfo(dj.Imported):
 
             nchannels = 1  # Assumes a single channel
             nframes = len(time_stamps) - 1
-            px_height = metadata["ROI"]["height"]
-            px_width = metadata["ROI"]["width"]
+            try:
+                px_height = metadata["ROI"]["height"]
+                px_width = metadata["ROI"]["width"]
+            except KeyError:
+                miniscope_video = cv2.VideoCapture(recording_filepaths[0])
+                px_height = int(miniscope_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                px_width = int(miniscope_video.get(cv2.CAP_PROP_FRAME_WIDTH))
+                miniscope_video.release()
             fps = int(metadata["frameRate"].replace("FPS", ""))
             time_stamps = np.array(time_stamps[1:], dtype=float)[:, 0]
 
@@ -352,6 +365,19 @@ class RecordingInfo(dj.Imported):
             time_stamps = (recording_timestamps[" time (ms)"] / 1000).values
             px_height = metadata["microscope"]["fov"]["height"]
             px_width = metadata["microscope"]["fov"]["width"]
+
+        elif acq_software == "Bonsai":
+            logger.warning(
+                f"Limited support for Bonsai recordings. Metadata will be extracted directly from the `.avi` files. To improve support, please contact the developers or open an issue on the GitHub repository."
+            )
+
+            miniscope_video = cv2.VideoCapture(recording_filepaths[0])
+
+            nchannels = 1
+            nframes = int(miniscope_video.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = miniscope_video.get(cv2.CAP_PROP_FPS)
+            px_height = int(miniscope_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            px_width = int(miniscope_video.get(cv2.CAP_PROP_FRAME_WIDTH))
 
         else:
             raise NotImplementedError(
@@ -518,7 +544,7 @@ class ProcessingTask(dj.Manual):
     and the triggering of new analysis for all supported analysis methods.
 
     Attributes:
-        RecordingInfo (foreign key): Primary key from RecordingInfo.
+        Recording (foreign key): Primary key from Recording.
         ProcessingParamSet (foreign key): Primary key from ProcessingParamSet.
         processing_output_dir (str): Output directory of the processed scan relative to the root data directory.
         task_mode (str): One of 'load' (load computed analysis results) or 'trigger'
@@ -526,7 +552,7 @@ class ProcessingTask(dj.Manual):
     """
 
     definition = """# Manual table for defining a processing task ready to be run
-    -> RecordingInfo
+    -> Recording
     -> ProcessingParamSet
     ---
     processing_output_dir='': varchar(255)    # relative to the root data directory
@@ -640,24 +666,62 @@ class Processing(dj.Computed):
     package_version=''  : varchar(16)
     """
 
-    def make(self, key):
+    class File(dj.Part):
+        definition = """
+        -> master
+        file_name: varchar(255)     # file name
+        ---
+        file: filepath@miniscope-processed
+        """
+
+    @property
+    def key_source(self):
+        return ProcessingTask & RecordingInfo
+
+    def make_fetch(self, key):
+        task_mode, processing_output_dir = (ProcessingTask & key).fetch1(
+            "task_mode", "processing_output_dir"
+        )
+        method = (ProcessingParamSet & key).fetch1("processing_method")
+        avi_files = (RecordingInfo.File & key).fetch("file_path")
+        processing_params = (ProcessingParamSet & key).fetch1("params")
+        sampling_rate = (RecordingInfo & key).fetch1("fps")
+
+        return (
+            task_mode,
+            processing_output_dir,
+            method,
+            avi_files,
+            processing_params,
+            sampling_rate,
+        )
+
+    def make_compute(
+        self,
+        key,
+        task_mode,
+        processing_output_dir,
+        method,
+        avi_files,
+        processing_params,
+        sampling_rate,
+    ):
         """
         Execute the miniscope analysis defined by the ProcessingTask.
         - task_mode: 'load', confirm that the results are already computed.
         - task_mode: 'trigger' runs the analysis.
         """
-        task_mode, output_dir = (ProcessingTask & key).fetch1(
-            "task_mode", "processing_output_dir"
-        )
+        if method != "caiman":
+            raise NotImplementedError(f"Method {method} is not supported")
 
-        if not output_dir:
+        params = copy.deepcopy(processing_params)
+
+        if not processing_output_dir:
             output_dir = ProcessingTask.infer_output_dir(key, relative=True, mkdir=True)
-            # update processing_output_dir
-            ProcessingTask.update1(
-                {**key, "processing_output_dir": output_dir.as_posix()}
-            )
+        else:
+            output_dir = processing_output_dir
         try:
-            output_dir = find_full_path(get_miniscope_root_data_dir(), output_dir)
+            output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
         except FileNotFoundError as e:
             if task_mode == "trigger":
                 processed_dir = pathlib.Path(get_processed_root_data_dir())
@@ -676,48 +740,180 @@ class Processing(dj.Computed):
                     f"Loading of {method} data is not yet supported"
                 )
         elif task_mode == "trigger":
-            method = (
-                ProcessingTask * ProcessingParamSet * ProcessingMethod * Recording & key
-            ).fetch1("processing_method")
+            import multiprocessing
+            import caiman as cm
+            from caiman.motion_correction import MotionCorrect
+            from caiman.source_extraction.cnmf.cnmf import CNMF
+            from caiman.source_extraction.cnmf.params import CNMFParams
+            from element_interface.run_caiman import _save_mc
 
-            if method == "caiman":
-                import caiman
-                from element_interface.run_caiman import run_caiman
+            extra_params = params.pop("extra_dj_params", {})
 
-                avi_files = (
-                    Recording * RecordingInfo * RecordingInfo.File & key
-                ).fetch("file_path")
-                avi_files = [
-                    find_full_path(get_miniscope_root_data_dir(), avi_file).as_posix()
-                    for avi_file in avi_files
-                ]
-
-                params = (ProcessingTask * ProcessingParamSet & key).fetch1("params")
-                sampling_rate = (
-                    ProcessingTask * Recording * RecordingInfo & key
-                ).fetch1("fps")
-
-                run_caiman(
-                    file_paths=avi_files,
-                    parameters=params,
-                    sampling_rate=sampling_rate,
-                    output_dir=output_dir.as_posix(),
-                    is3D=False,
-                )
-
-                _, imaging_dataset = get_loader_result(key, ProcessingTask)
-                caiman_dataset = imaging_dataset
-                key["processing_time"] = caiman_dataset.creation_time
-                key["package_version"] = caiman.__version__
+            avi_files = [
+                find_full_path(get_miniscope_root_data_dir(), avi_file).as_posix()
+                for avi_file in avi_files
+            ]
+            params["fnames"] = avi_files
+            params["fr"] = sampling_rate
+            params["is3D"] = False
+            if "indices" in params:
+                params["motion"] = {
+                    "indices": (
+                        slice(*params.get("indices")[0]),
+                        slice(*params.get("indices")[1]),
+                    )
+                }
             else:
-                raise NotImplementedError(
-                    f"Automatic triggering of {method} analysis"
-                    f" is not yet supported"
+                params["motion"] = {"indices": (slice(None), slice(None))}
+
+            @memoized_result(
+                uniqueness_dict=params,
+                output_directory=output_dir,
+            )
+            def _run_processing():
+                mc_indices = params["motion"].get("indices")
+                caiman_temp = os.environ.get("CAIMAN_TEMP")
+                os.environ["CAIMAN_TEMP"] = str(output_dir)
+                n_processes = np.floor(multiprocessing.cpu_count() * 0.6)
+                n_processes = int(os.getenv("CAIMAN_MC_N_PROCESSES", n_processes))
+                _, dview, n_processes = cm.cluster.setup_cluster(
+                    backend="multiprocessing",
+                    n_processes=n_processes,
+                    maxtasksperchild=1,
                 )
+                try:
+                    opts = CNMFParams(params_dict=params)
+                    cnm = CNMF(n_processes, params=opts, dview=dview)
+                    fnames = cnm.params.get("data", "fnames")
+                    mc = MotionCorrect(fnames, dview=cnm.dview, **cnm.params.motion)
+                    mc_base_attrs = list(mc.__dict__)
+                    logger.info("Starting motion correction (CaImAn)...")
+                    mc.motion_correct(save_movie=mc_indices is None)
+                    mc_results = {
+                        k: v for k, v in mc.__dict__.items() if k not in mc_base_attrs
+                    }
+                    if cnm.params.get("motion", "pw_rigid"):
+                        mc_results["b0"] = np.ceil(
+                            np.max(np.abs(mc.shifts_rig))
+                        ).astype(int)
+                        cnm.estimates.shifts = mc.shifts_rig
+                        if cnm.params.get("motion", "is3D"):
+                            cnm.estimates.shifts = [
+                                mc.x_shifts_els,
+                                mc.y_shifts_els,
+                                mc.z_shifts_els,
+                            ]
+                        else:
+                            cnm.estimates.shifts = [mc.x_shifts_els, mc.y_shifts_els]
+                    else:
+                        mc_results["b0"] = np.ceil(
+                            np.max(np.abs(mc.shifts_rig))
+                        ).astype(int)
+                        cnm.estimates.shifts = mc.shifts_rig
+
+                    base_name = pathlib.Path(fnames[0]).stem
+                    fname_mc = (
+                        mc.fname_tot_els
+                        if cnm.params.motion["pw_rigid"]
+                        else mc.fname_tot_rig
+                    )
+                    if all(fname_mc):
+                        logger.info("Generating C-order memmap file...")
+                        border_to_0 = 0 if mc.border_nan == "copy" else mc.border_to_0
+                        fname_new = cm.mmapping.save_memmap(
+                            fname_mc,
+                            base_name=base_name + "_mc",
+                            order="C",
+                            var_name_hdf5=cnm.params.get("data", "var_name_hdf5"),
+                            border_to_0=border_to_0,
+                        )
+                    else:
+                        logger.info(
+                            "Applying shifts, then generating C-order memmap file..."
+                        )
+                        fname_new = mc.apply_shifts_movie(
+                            fnames,
+                            save_memmap=True,
+                            save_base_name=base_name + "_mc",
+                            order="C",
+                        )
+                        mc.mmap_file = [fname_new]
+                    Yr, dims, T = cm.mmapping.load_memmap(fname_new)
+                    images = np.reshape(Yr.T, [T] + list(dims), order="F")
+                    cnm.mmap_file = fname_new
+                    logger.info("Starting CNMF analysis...")
+                    cnm.fit(images, indices=(slice(None), slice(None)))
+                    cnm.estimates.evaluate_components(
+                        images, cnm.params, dview=cnm.dview
+                    )
+                    cnm.estimates.detrend_df_f(quantileMin=8, frames_window=250)
+                    logger.info("Computing summary images...")
+                    correlation_image, _ = cm.summary_images.correlation_pnr(
+                        images[:: max(T // 1000, 1)],
+                        gSig=cnm.params.init["gSig"][0],
+                        swap_dim=False,
+                    )
+                    correlation_image[np.isnan(correlation_image)] = 0
+                    cnm.estimates.Cn = correlation_image
+                    fname_hdf5 = cnm.mmap_file[:-4] + "hdf5"
+                    cnm.save(fname_hdf5)
+                    cnmf_output_file = pathlib.Path(fname_hdf5)
+                    summary_images = {
+                        "average_image": np.mean(images[:: max(T // 1000, 1)], axis=0),
+                        "max_image": np.max(images[:: max(T // 1000, 1)], axis=0),
+                        "correlation_image": correlation_image,
+                    }
+                    _save_mc(
+                        mc,
+                        cnmf_output_file.as_posix(),
+                        params["is3D"],
+                        summary_images=summary_images,
+                    )
+                except Exception as e:
+                    dview.terminate()
+                    raise e
+                else:
+                    cm.stop_server(dview=dview)
+                    logger.info("CNMF analysis complete. Resulted saved.")
+                    caiman_temp = os.environ.get("CAIMAN_TEMP")
+                    if caiman_temp is not None:
+                        os.environ["CAIMAN_TEMP"] = caiman_temp
+                    else:
+                        del os.environ["CAIMAN_TEMP"]
+
+            _run_processing()
+            _, imaging_dataset = get_loader_result(key, ProcessingTask, full_output_dir=output_dir)
+            caiman_dataset = imaging_dataset
+            key["processing_time"] = caiman_dataset.creation_time
+            key["package_version"] = cm.__version__
+            file_entries = [
+                {
+                    **key,
+                    "file_name": f.relative_to(
+                        get_processed_root_data_dir()
+                    ).as_posix(),
+                    "file": f.as_posix(),
+                }
+                for f in output_dir.rglob("*")
+                if f.is_file()
+            ]
         else:
             raise ValueError(f"Unknown task mode: {task_mode}")
+        return (file_entries, output_dir)
 
-        self.insert1(key)
+    def make_insert(self, key, file_entries, output_dir):
+        # update processing_output_dir
+        ProcessingTask.update1(
+            {
+                **key,
+                "processing_output_dir": output_dir.relative_to(
+                    get_processed_root_data_dir()
+                ).as_posix(),
+            }
+        )
+        self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
+        for file in file_entries:
+            self.File.insert1(file, ignore_extra_fields=True)
 
 
 # Motion Correction --------------------------------------------------------------------
@@ -1283,12 +1479,8 @@ class ProcessingQualityMetrics(dj.Computed):
 
 # Helper Functions ---------------------------------------------------------------------
 
-_table_attribute_mapper = {
-    "ProcessingTask": "processing_output_dir",
-}
 
-
-def get_loader_result(key, table) -> tuple:
+def get_loader_result(key, table, full_output_dir=None) -> tuple:
     """Retrieve the loaded processed imaging results from the loader (e.g. caiman, etc.)
 
     Args:
@@ -1300,12 +1492,14 @@ def get_loader_result(key, table) -> tuple:
         method, loaded_output (tuple): method string and loader object with results (e.g. caiman.CaImAn, etc.)
     """
 
-    method, output_dir = (ProcessingParamSet * table & key).fetch1(
-        "processing_method", _table_attribute_mapper[table.__name__]
-    )
-
-    output_dir = find_full_path(get_miniscope_root_data_dir(), output_dir)
-
+    if full_output_dir is None:
+        output_dir = (ProcessingParamSet * table & key).fetch1(
+            "processing_output_dir"
+        )
+        output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
+    else:
+        output_dir = full_output_dir
+    method = (ProcessingParamSet * table & key).fetch1("processing_method")
     if method == "caiman":
         from element_interface import caiman_loader
 
