@@ -1497,6 +1497,8 @@ def get_loader_result(key, table, full_output_dir=None) -> tuple:
             "processing_output_dir"
         )
         output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
+    else:
+        output_dir = full_output_dir
     method = (ProcessingParamSet * table & key).fetch1("processing_method")
     if method == "caiman":
         from element_interface import caiman_loader
