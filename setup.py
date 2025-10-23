@@ -13,15 +13,6 @@ with open(path.join(here, pkg_name, "version.py")) as f:
     exec(f.read())
 
 setup(
-    name=pkg_name.replace("_", "-"),
-    version=__version__,  # noqa: F821
-    description="Miniscope DataJoint Element",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    author="DataJoint",
-    author_email="info@datajoint.com",
-    license="MIT",
-    url=f'https://github.com/datajoint/{pkg_name.replace("_", "-")}',
     keywords="neuroscience miniscope science datajoint",
     packages=["element_miniscope", "element_miniscope.plotting"],
     scripts=[],
