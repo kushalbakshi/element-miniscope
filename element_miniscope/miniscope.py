@@ -1066,9 +1066,8 @@ class MotionCorrection(dj.Imported):
                     nonrigid_blocks,
                 ) = caiman_dataset.extract_pw_rigid_mc()
                 nonrigid_correction.update(**key)
-                nonrigid_blocks.update(**key)
                 self.NonRigidMotionCorrection.insert1(nonrigid_correction)
-                self.Block.insert(nonrigid_blocks)
+                self.Block.insert([{**block, **key} for block in nonrigid_blocks.values()])
             else:
                 # -- rigid motion correction --
                 rigid_correction = caiman_dataset.extract_rigid_mc()
