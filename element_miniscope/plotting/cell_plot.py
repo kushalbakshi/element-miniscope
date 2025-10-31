@@ -44,7 +44,7 @@ def plot_all_rois(
         if contours is not None:
             for contour in contours:
                 ax.plot(
-                    contour[:, 0], contour[:, 1], color=color, linewidth=2, alpha=0.8
+                    contour[:, 1], contour[:, 0], color=color, linewidth=2, alpha=0.9
                 )
 
     ax.set_xlim(0, summary_image.shape[1])
@@ -103,8 +103,8 @@ def plot_highlighted_roi(
 
             for contour in contours:
                 ax_spatial.plot(
-                    contour[:, 0],
                     contour[:, 1],
+                    contour[:, 0],
                     color=color,
                     linewidth=linewidth,
                     alpha=alpha,
