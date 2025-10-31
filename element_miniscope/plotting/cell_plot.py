@@ -55,6 +55,19 @@ def plot_all_rois(
     return fig
 
 
+def plot_x_y_shifts(x_shifts, y_shifts, figsize=(10, 8)):
+    """Plot x and y shifts"""
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.plot(x_shifts, label="X Shifts")
+    ax.plot(y_shifts, label="Y Shifts")
+    ax.legend()
+    ax.set_xlabel("Frame #", fontsize=12)
+    ax.set_ylabel("Shift (pixels)", fontsize=12)
+    ax.set_title("X and Y Shifts from Motion Correction", fontsize=14, fontweight="bold")
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    return fig
+
 def plot_highlighted_roi(
     summary_image,
     roi_data,

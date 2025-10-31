@@ -146,3 +146,38 @@ class MiniscopeOverlayPlots(dj.Computed):
         self.insert1({**key, "summary_image_all_rois": correlation_image_overlay_file})
         self.SummaryImageByRoi.insert(part_inserts)
         tmpdir.cleanup()
+
+
+@schema
+class MotionCorrectionShiftsPlots(dj.Computed):
+    definition = """# Plot of x and y shifts from motion correction
+    -> miniscope.MotionCorrection
+    ---
+    x_y_shifts_plot: attach  # plot of x and y shifts from motion correction
+    """
+
+    def make_fetch(self, key):
+        if not miniscope.MotionCorrection.RigidMotionCorrection & key:
+            raise ValueError(f"No rigid motion correction information found for this key: {key}")
+
+        x_shifts, y_shifts = (miniscope.MotionCorrection.RigidMotionCorrection & key).fetch1("x_shifts", "y_shifts")
+
+        return (x_shifts, y_shifts)
+    
+    
+    def make_compute(self, key, x_shifts, y_shifts):
+        from .plotting.cell_plot import plot_x_y_shifts
+        
+        tmpdir = tempfile.TemporaryDirectory()
+        x_y_shifts_plot_file = Path(tmpdir.name) / "x_y_shifts_plot.png"
+        
+        fig = plot_x_y_shifts(x_shifts, y_shifts)
+        fig.savefig(x_y_shifts_plot_file, format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+
+        return x_y_shifts_plot_file, tmpdir
+
+    
+    def make_insert(self, key, x_y_shifts_plot_file, tmpdir):
+        self.insert1({**key, "x_y_shifts_plot": x_y_shifts_plot_file})
+        tmpdir.cleanup()
