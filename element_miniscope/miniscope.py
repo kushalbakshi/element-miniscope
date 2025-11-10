@@ -882,7 +882,9 @@ class Processing(dj.Computed):
                         del os.environ["CAIMAN_TEMP"]
 
             _run_processing()
-            _, imaging_dataset = get_loader_result(key, ProcessingTask, full_output_dir=output_dir)
+            _, imaging_dataset = get_loader_result(
+                key, ProcessingTask, full_output_dir=output_dir
+            )
             caiman_dataset = imaging_dataset
             key["processing_time"] = caiman_dataset.creation_time
             key["package_version"] = cm.__version__
@@ -1067,7 +1069,9 @@ class MotionCorrection(dj.Imported):
                 ) = caiman_dataset.extract_pw_rigid_mc()
                 nonrigid_correction.update(**key)
                 self.NonRigidMotionCorrection.insert1(nonrigid_correction)
-                self.Block.insert([{**block, **key} for block in nonrigid_blocks.values()])
+                self.Block.insert(
+                    [{**block, **key} for block in nonrigid_blocks.values()]
+                )
             else:
                 # -- rigid motion correction --
                 rigid_correction = caiman_dataset.extract_rigid_mc()
@@ -1492,9 +1496,7 @@ def get_loader_result(key, table, full_output_dir=None) -> tuple:
     """
 
     if full_output_dir is None:
-        output_dir = (ProcessingParamSet * table & key).fetch1(
-            "processing_output_dir"
-        )
+        output_dir = (ProcessingParamSet * table & key).fetch1("processing_output_dir")
         output_dir = find_full_path(get_processed_root_data_dir(), output_dir)
     else:
         output_dir = full_output_dir

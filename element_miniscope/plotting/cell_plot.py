@@ -63,10 +63,13 @@ def plot_x_y_shifts(x_shifts, y_shifts, figsize=(10, 8)):
     ax.legend()
     ax.set_xlabel("Frame #", fontsize=12)
     ax.set_ylabel("Shift (pixels)", fontsize=12)
-    ax.set_title("X and Y Shifts from Motion Correction", fontsize=14, fontweight="bold")
+    ax.set_title(
+        "X and Y Shifts from Motion Correction", fontsize=14, fontweight="bold"
+    )
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
     return fig
+
 
 def plot_highlighted_roi(
     summary_image,
