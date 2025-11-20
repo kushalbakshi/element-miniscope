@@ -77,6 +77,7 @@ def plot_highlighted_roi(
     fluorescence_traces,
     roi_to_highlight,
     roi_id,
+    fps,
     summary_image_type="Correlation Image",
     figsize=(12, 8),
 ):
@@ -134,9 +135,9 @@ def plot_highlighted_roi(
     # Fluorescence trace
     if roi_to_highlight < len(fluorescence_traces):
         trace_data = fluorescence_traces[roi_to_highlight]
-        timepoints = np.arange(len(trace_data))
+        timepoints = np.arange(len(trace_data)) / fps
         ax_trace.plot(timepoints, trace_data, color="red", linewidth=2)
-        ax_trace.set_xlabel("Frame #", fontsize=12)
+        ax_trace.set_xlabel("Time (s)", fontsize=12)
         ax_trace.set_ylabel("Fluorescence", fontsize=12)
         ax_trace.set_title(
             f"ROI {roi_id} Fluorescence Trace", fontsize=14, fontweight="bold"

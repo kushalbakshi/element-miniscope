@@ -93,9 +93,10 @@ class MiniscopeOverlayPlots(dj.Computed):
         fluorescence_traces = (
             miniscope.Fluorescence.Trace & key & "fluorescence_channel=0"
         ).fetch("fluorescence", order_by="mask ASC")
-        return corr_img, roi_data, fluorescence_traces
+        fps = (miniscope.RecordingInfo & key).fetch1("fps")
+        return corr_img, roi_data, fluorescence_traces, fps
 
-    def make_compute(self, key, corr_img, roi_data, fluorescence_traces):
+    def make_compute(self, key, corr_img, roi_data, fluorescence_traces, fps):
         from .plotting.cell_plot import plot_all_rois, plot_highlighted_roi
 
         tmpdir = tempfile.TemporaryDirectory()
@@ -124,6 +125,7 @@ class MiniscopeOverlayPlots(dj.Computed):
                 fluorescence_traces,
                 roi_to_highlight=idx,
                 roi_id=mask_id,
+                fps=fps,
             )
 
             filepath = Path(tmpdir.name) / f"image_by_roi_{mask_id}.png"
