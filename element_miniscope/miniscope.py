@@ -841,7 +841,18 @@ class Processing(dj.Computed):
                     Yr, dims, T = cm.mmapping.load_memmap(fname_new)
                     images = np.reshape(Yr.T, [T] + list(dims), order="F")
                     cnm.mmap_file = fname_new
-                    logger.info("Starting CNMF analysis...")
+                    # terminate the previous cluster and setup a new one with fewer
+                    # processes for CNMF because it is memory intensive
+                    dview.terminate()
+                    n_processes = np.floor(multiprocessing.cpu_count() * 0.2)
+                    n_processes = int(os.getenv("CAIMAN_CNMF_N_PROCESSES", n_processes))
+                    _, dview, n_processes = cm.cluster.setup_cluster(
+                        backend="multiprocessing",
+                        n_processes=n_processes,
+                        maxtasksperchild=1,
+                    )
+                    logger.info(f"Starting CNMF analysis with {n_processes} processes...")
+
                     cnm.fit(images, indices=(slice(None), slice(None)))
                     cnm.estimates.evaluate_components(
                         images, cnm.params, dview=cnm.dview
