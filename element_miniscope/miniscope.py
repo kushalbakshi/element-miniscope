@@ -914,8 +914,8 @@ class Processing(dj.Computed):
             }
         )
         self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
-        for file in file_entries:
-            self.File.insert1(file, ignore_extra_fields=True)
+        # for file in file_entries:
+        #     self.File.insert1(file, ignore_extra_fields=True)
 
 
 # Motion Correction --------------------------------------------------------------------
