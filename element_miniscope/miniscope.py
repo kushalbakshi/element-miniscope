@@ -321,37 +321,68 @@ class RecordingInfo(dj.Imported):
             fps = video.get(cv2.CAP_PROP_FPS)
 
         elif acq_software == "Miniscope-DAQ-V4":
+            metadata = None  # Initialize to handle the no-metadata case
+
             try:
                 recording_metadata = next(recording_path.glob("metaData.json"))
-            except StopIteration:
-                raise FileNotFoundError(
-                    f"No .json file found in " f"{recording_directory}"
-                )
-            try:
-                recording_timestamps = next(recording_path.glob("timeStamps.csv"))
-            except StopIteration:
-                raise FileNotFoundError(
-                    f"No timestamp (*.csv) file found in " f"{recording_directory}"
-                )
-
-            with open(recording_metadata.as_posix()) as f:
-                metadata = json.loads(f.read())
-
-            with open(recording_timestamps, newline="") as f:
-                time_stamps = list(csv.reader(f, delimiter=","))
-
-            nchannels = 1  # Assumes a single channel
-            nframes = len(time_stamps) - 1
-            try:
+                with open(recording_metadata.as_posix()) as f:
+                    metadata = json.loads(f.read())
                 px_height = metadata["ROI"]["height"]
                 px_width = metadata["ROI"]["width"]
-            except KeyError:
+                fps = int(metadata["frameRate"].replace("FPS", ""))
+            except StopIteration:
+                logger.warning(
+                    f"No metaData.json file found in {recording_directory}\n"
+                    "Extracting metadata from the .avi file header instead."
+                )
                 miniscope_video = cv2.VideoCapture(recording_filepaths[0])
                 px_height = int(miniscope_video.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 px_width = int(miniscope_video.get(cv2.CAP_PROP_FRAME_WIDTH))
+                fps = miniscope_video.get(cv2.CAP_PROP_FPS)
                 miniscope_video.release()
-            fps = int(metadata["frameRate"].replace("FPS", ""))
-            time_stamps = np.array(time_stamps[1:], dtype=float)[:, 0]
+
+            # Handle timestamps for multiple vs single AVI files
+            time_stamps = None
+            if len(recording_filepaths) > 1:
+                # Multiple AVI files - look for timestamp CSV paired with each AVI
+                timestamps_files = sorted(recording_path.glob("*.csv"))
+                all_timestamps = []
+                for timestamps_file in timestamps_files:
+                    with open(timestamps_file, newline="") as f:
+                        reader = csv.reader(f, delimiter=",")
+                        next(reader)  # Skip header for each file
+                        all_timestamps.extend(list(reader))
+                if all_timestamps:
+                    time_stamps = np.array(all_timestamps, dtype=float)[:, 0]
+                    nframes = len(time_stamps)
+                else:
+                    logger.warning(
+                        f"No timestamp CSV files found in {recording_directory}"
+                    )
+            else:
+                try:
+                    recording_timestamps = next(recording_path.glob("timeStamps.csv"))
+                    with open(recording_timestamps, newline="") as f:
+                        reader = csv.reader(f, delimiter=",")
+                        next(reader)  # Skip header
+                        time_stamps = np.array(list(reader), dtype=float)[:, 0]
+                    nframes = len(time_stamps)
+                except StopIteration:
+                    logger.warning(
+                        f"No timeStamps.csv file found in {recording_directory}"
+                    )
+
+            # Fallback: get nframes from video if timestamps not available
+            if time_stamps is None or len(time_stamps) == 0:
+                total_frames = 0
+                for avi_file in recording_filepaths:
+                    video = cv2.VideoCapture(avi_file)
+                    total_frames += int(video.get(cv2.CAP_PROP_FRAME_COUNT))
+                    video.release()
+                nframes = total_frames
+
+            nchannels = 1  # Assumes a single channel
+            
 
         elif acq_software == "Inscopix":
             inscopix_metadata = next(recording_path.glob("session.json"))
@@ -413,14 +444,14 @@ class RecordingInfo(dj.Imported):
             ]
         )
 
-        if acq_software in ("Inscopix", "Miniscope-DAQ-V4"):
+        if acq_software == "Inscopix":
             self.Timestamps.insert1(dict(**key, timestamps=time_stamps))
-            self.Config.insert1(
-                dict(
-                    **key,
-                    config=metadata,
-                )
-            )
+            self.Config.insert1(dict(**key, config=metadata))
+        elif acq_software == "Miniscope-DAQ-V4":
+            if time_stamps is not None and len(time_stamps) > 0:
+                self.Timestamps.insert1(dict(**key, timestamps=time_stamps))
+            if metadata is not None:
+                self.Config.insert1(dict(**key, config=metadata))
 
 
 # Trigger a processing routine -------------------------------------------------
