@@ -882,6 +882,7 @@ class Processing(dj.Computed):
                         n_processes=n_processes,
                         maxtasksperchild=1,
                     )
+                    cnm.dview = dview
                     logger.info(f"Starting CNMF analysis with {n_processes} processes...")
 
                     cnm.fit(images, indices=(slice(None), slice(None)))
