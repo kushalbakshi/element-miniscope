@@ -64,6 +64,7 @@ class QualityMetrics(dj.Imported):
 
 @schema
 class MiniscopeOverlayPlots(dj.Computed):
+    """Plot of all ROIs overlayed on correlation image"""
     definition = """
     -> miniscope.Fluorescence
     ---
@@ -71,6 +72,7 @@ class MiniscopeOverlayPlots(dj.Computed):
     """
 
     class SummaryImageByRoi(dj.Part):
+        """Plot of individual ROIs overlayed on correlation image"""
         definition = """
         -> master
         -> miniscope.Fluorescence.Trace
