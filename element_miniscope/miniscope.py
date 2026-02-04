@@ -972,20 +972,16 @@ class Processing(dj.Computed):
                 import psutil
                 from dask.distributed import Client, LocalCluster
                 from minian.cnmf import (
-                    compute_AtC,
                     compute_trace,
                     get_noise_fft,
-                    smooth_sig,
                     unit_merge,
                     update_spatial,
                     update_temporal,
                     update_background,
                 )
                 from minian.initialization import (
-                    gmm_refine,
                     initA,
                     initC,
-                    intensity_refine,
                     ks_refine,
                     pnr_refine,
                     seeds_init,
@@ -998,22 +994,9 @@ class Processing(dj.Computed):
                     TaskAnnotation,
                     get_optimal_chk,
                     load_videos,
-                    open_minian,
                     save_minian,
                 )
-                from minian.visualization import (
-                    CNMFViewer,
-                    export_plot,
-                    VArrayViewer,
-                    generate_videos,
-                    visualize_gmm_fit,
-                    visualize_motion,
-                    visualize_preprocess,
-                    visualize_seeds,
-                    visualize_spatial_update,
-                    visualize_temporal_update,
-                    write_video,
-                )
+                from minian.visualization import write_video
 
                 # Setup Dask cluster with env vars or auto-config
                 n_workers = int(
