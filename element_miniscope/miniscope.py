@@ -1037,10 +1037,10 @@ class Processing(dj.Computed):
                     logger.info("Loading videos...")
                     param_load_videos = params.get(
                         "param_load_videos",
-                        {"pattern": "r'.*\.avi$'", "downsample_strategy": "subset"},
+                        {"pattern": "r'Miniscope_video.avi$'", "downsample_strategy": "subset"},
                     )
                     video_array = load_videos(
-                        str(avi_files[0].parent), **param_load_videos
+                        str(pathlib.Path(avi_files[0]).parent), **param_load_videos
                     )
                     chunk_size, _ = get_optimal_chk(video_array, dtype=float)
                     video_array = video_array.chunk(
