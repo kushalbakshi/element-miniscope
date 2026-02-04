@@ -45,7 +45,7 @@ setup(
             "dask==2022.5.0",
             "xarray==2022.3.0",
             "pandas==1.5.3",
-            "distributed=2023.12.1",
+            "distributed==2022.5.0",
             "minian @ git+https://github.com/kushalbakshi/minian.git",
         ]
     },
