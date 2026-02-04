@@ -1039,10 +1039,12 @@ class Processing(dj.Computed):
 
                     # ===== LOAD VIDEOS =====
                     logger.info("Loading videos...")
-                    param_load_videos = params.get(
-                        "param_load_videos",
-                        {"pattern": "Miniscope_video.avi", "downsample_strategy": "subset"},
-                    )
+                    default_load_params = {
+                        "pattern": "Miniscope_video.avi",
+                        "dtype": "uint8",
+                        "downsample_strategy": "subset"
+                    }
+                    param_load_videos = {**default_load_params, **params.get("param_load_videos", {})}
                     video_array = load_videos(
                         str(pathlib.Path(avi_files[0]).parent), **param_load_videos
                     )
