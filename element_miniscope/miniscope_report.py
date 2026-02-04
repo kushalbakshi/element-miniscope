@@ -1,5 +1,7 @@
 import datajoint as dj
-
+import matplotlib.pyplot as plt
+import tempfile
+from pathlib import Path
 from . import miniscope
 
 schema = dj.schema()
@@ -58,3 +60,130 @@ class QualityMetrics(dj.Imported):
         )
 
         self.insert1(key)
+
+
+@schema
+class MiniscopeOverlayPlots(dj.Computed):
+    """Plot of all ROIs overlayed on correlation image"""
+    definition = """
+    -> miniscope.Fluorescence
+    ---
+    summary_image_all_rois: attach  # ROIs overlayed on correlation image
+    """
+
+    class SummaryImageByRoi(dj.Part):
+        """Plot of individual ROIs overlayed on correlation image"""
+        definition = """
+        -> master
+        -> miniscope.Fluorescence.Trace
+        ---
+        summary_image_by_roi_png: attach  # ROIs overlayed on correlation image
+        """
+
+    def make_fetch(self, key):
+        corr_img = (miniscope.MotionCorrection.Summary & key).fetch1(
+            "correlation_image"
+        )
+        roi_data = (miniscope.Segmentation.Mask & key).fetch(
+            "mask",
+            "mask_xpix",
+            "mask_ypix",
+            "mask_weights",
+            as_dict=True,
+            order_by="mask ASC",
+        )
+        fluorescence_traces = (
+            miniscope.Fluorescence.Trace & key & "fluorescence_channel=0"
+        ).fetch("fluorescence", order_by="mask ASC")
+        fps = (miniscope.RecordingInfo & key).fetch1("fps")
+        return corr_img, roi_data, fluorescence_traces, fps
+
+    def make_compute(self, key, corr_img, roi_data, fluorescence_traces, fps):
+        from .plotting.cell_plot import plot_all_rois, plot_highlighted_roi
+
+        tmpdir = tempfile.TemporaryDirectory()
+        if len(corr_img.shape) == 3:
+            corr_img = corr_img[0, :, :]  # Use first channel
+
+        # Create all-ROI overlay plot
+        image_overlay_fig = plot_all_rois(corr_img, roi_data)
+        correlation_image_overlay_file = (
+            Path(tmpdir.name) / "correlation_image_overlay.png"
+        )
+        image_overlay_fig.savefig(
+            correlation_image_overlay_file, format="png", bbox_inches="tight", dpi=100
+        )
+        plt.close(image_overlay_fig)
+
+        # Create individual ROI plots
+        image_by_roi_overlays_files = []
+        part_inserts = []
+
+        for idx, roi in enumerate(roi_data):
+            mask_id = roi["mask"]
+            fig = plot_highlighted_roi(
+                corr_img,
+                roi_data,
+                fluorescence_traces,
+                roi_to_highlight=idx,
+                roi_id=mask_id,
+                fps=fps,
+            )
+
+            filepath = Path(tmpdir.name) / f"image_by_roi_{mask_id}.png"
+            fig.savefig(filepath, format="png", bbox_inches="tight", dpi=100)
+            plt.close(fig)
+
+            image_by_roi_overlays_files.append(filepath)
+            part_inserts.append(
+                {
+                    **key,
+                    "fluorescence_channel": 0,
+                    "mask": mask_id,
+                    "summary_image_by_roi_png": filepath,
+                }
+            )
+
+        return correlation_image_overlay_file, part_inserts, tmpdir
+
+    def make_insert(self, key, correlation_image_overlay_file, part_inserts, tmpdir):
+        self.insert1({**key, "summary_image_all_rois": correlation_image_overlay_file})
+        self.SummaryImageByRoi.insert(part_inserts)
+        tmpdir.cleanup()
+
+
+@schema
+class MotionCorrectionShiftsPlots(dj.Computed):
+    definition = """# Plot of x and y shifts from motion correction
+    -> miniscope.MotionCorrection
+    ---
+    x_y_shifts_plot: attach  # plot of x and y shifts from motion correction
+    """
+
+    def make_fetch(self, key):
+        if not miniscope.MotionCorrection.RigidMotionCorrection & key:
+            raise ValueError(
+                f"No rigid motion correction information found for this key: {key}"
+            )
+
+        x_shifts, y_shifts = (
+            miniscope.MotionCorrection.RigidMotionCorrection & key
+        ).fetch1("x_shifts", "y_shifts")
+
+        return (x_shifts, y_shifts)
+
+    def make_compute(self, key, x_shifts, y_shifts):
+        from .plotting.cell_plot import plot_x_y_shifts
+
+        tmpdir = tempfile.TemporaryDirectory()
+        x_y_shifts_plot_file = Path(tmpdir.name) / "x_y_shifts_plot.png"
+
+        fig = plot_x_y_shifts(x_shifts, y_shifts)
+        fig.savefig(x_y_shifts_plot_file, format="png", bbox_inches="tight", dpi=100)
+        plt.close(fig)
+
+        return x_y_shifts_plot_file, tmpdir
+
+    def make_insert(self, key, x_y_shifts_plot_file, tmpdir):
+        self.insert1({**key, "x_y_shifts_plot": x_y_shifts_plot_file})
+        tmpdir.cleanup()
