@@ -1007,9 +1007,13 @@ class Processing(dj.Computed):
                 )
                 memory_total = psutil.virtual_memory().total
                 memory_per_worker = int(memory_total * 0.4 / n_workers / 1e9)
-                memory_limit = os.getenv(
-                    "MINIAN_MEMORY_LIMIT", f"{memory_per_worker}GB"
-                )
+
+                memory_limit_env = os.getenv("MINIAN_MEMORY_LIMIT")
+                if memory_limit_env:
+                    # Add GB suffix if user provided just a number
+                    memory_limit = memory_limit_env if any(c.isalpha() for c in memory_limit_env) else f"{memory_limit_env}GB"
+                else:
+                    memory_limit = f"{memory_per_worker}GB"
 
                 # Set intermediate storage path
                 temp_path = str(output_dir / "intermediate")
