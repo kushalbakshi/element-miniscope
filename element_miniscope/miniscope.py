@@ -382,7 +382,6 @@ class RecordingInfo(dj.Imported):
                 nframes = total_frames
 
             nchannels = 1  # Assumes a single channel
-            
 
         elif acq_software == "Inscopix":
             inscopix_metadata = next(recording_path.glob("session.json"))
@@ -472,7 +471,10 @@ class ProcessingMethod(dj.Lookup):
     processing_method_desc: varchar(1000)
     """
 
-    contents = [("caiman", "caiman analysis suite")]
+    contents = [
+        ("caiman", "caiman analysis suite"),
+        ("minian", "minian analysis suite"),
+    ]
 
 
 @schema
@@ -717,6 +719,7 @@ class Processing(dj.Computed):
         avi_files = (RecordingInfo.File & key).fetch("file_path")
         processing_params = (ProcessingParamSet & key).fetch1("params")
         sampling_rate = (RecordingInfo & key).fetch1("fps")
+        px_height, px_width = (RecordingInfo & key).fetch1("px_height", "px_width")
 
         return (
             task_mode,
@@ -725,6 +728,8 @@ class Processing(dj.Computed):
             avi_files,
             processing_params,
             sampling_rate,
+            px_height,
+            px_width,
         )
 
     def make_compute(
@@ -736,13 +741,15 @@ class Processing(dj.Computed):
         avi_files,
         processing_params,
         sampling_rate,
+        px_height,
+        px_width,
     ):
         """
         Execute the miniscope analysis defined by the ProcessingTask.
         - task_mode: 'load', confirm that the results are already computed.
         - task_mode: 'trigger' runs the analysis.
         """
-        if method != "caiman":
+        if method not in ["caiman", "minian"]:
             raise NotImplementedError(f"Method {method} is not supported")
 
         params = copy.deepcopy(processing_params)
@@ -766,182 +773,594 @@ class Processing(dj.Computed):
             if method == "caiman":
                 loaded_caiman = loaded_result
                 key = {**key, "processing_time": loaded_caiman.creation_time}
+            elif method == "minian":
+                loaded_minian = loaded_result
+                key = {**key, "processing_time": loaded_minian.creation_time}
             else:
                 raise NotImplementedError(
                     f"Loading of {method} data is not yet supported"
                 )
         elif task_mode == "trigger":
-            import multiprocessing
-            import caiman as cm
-            from caiman.motion_correction import MotionCorrect
-            from caiman.source_extraction.cnmf.cnmf import CNMF
-            from caiman.source_extraction.cnmf.params import CNMFParams
-            from element_interface.run_caiman import _save_mc
-
-            extra_params = params.pop("extra_dj_params", {})
-
             avi_files = [
                 find_full_path(get_miniscope_root_data_dir(), avi_file).as_posix()
                 for avi_file in avi_files
             ]
-            params["fnames"] = avi_files
-            params["fr"] = sampling_rate
-            params["is3D"] = False
-            if "indices" in params:
-                params["motion"] = {
-                    "indices": (
-                        slice(*params.get("indices")[0]),
-                        slice(*params.get("indices")[1]),
-                    )
-                }
-            else:
-                params["motion"] = {"indices": (slice(None), slice(None))}
+            if method == "caiman":
+                import multiprocessing
+                import caiman as cm
+                from caiman.motion_correction import MotionCorrect
+                from caiman.source_extraction.cnmf.cnmf import CNMF
+                from caiman.source_extraction.cnmf.params import CNMFParams
+                from element_interface.run_caiman import _save_mc
 
-            @memoized_result(
-                uniqueness_dict=params,
-                output_directory=output_dir,
-            )
-            def _run_processing():
-                mc_indices = params["motion"].get("indices")
-                caiman_temp = os.environ.get("CAIMAN_TEMP")
-                os.environ["CAIMAN_TEMP"] = str(output_dir)
-                n_processes = np.floor(multiprocessing.cpu_count() * 0.6)
-                n_processes = int(os.getenv("CAIMAN_MC_N_PROCESSES", n_processes))
-                _, dview, n_processes = cm.cluster.setup_cluster(
-                    backend="multiprocessing",
-                    n_processes=n_processes,
-                    maxtasksperchild=1,
-                )
-                try:
-                    opts = CNMFParams(params_dict=params)
-                    cnm = CNMF(n_processes, params=opts, dview=dview)
-                    fnames = cnm.params.get("data", "fnames")
-                    mc = MotionCorrect(fnames, dview=cnm.dview, **cnm.params.motion)
-                    mc_base_attrs = list(mc.__dict__)
-                    logger.info("Starting motion correction (CaImAn)...")
-                    mc.motion_correct(save_movie=mc_indices is None)
-                    mc_results = {
-                        k: v for k, v in mc.__dict__.items() if k not in mc_base_attrs
+                extra_params = params.pop("extra_dj_params", {})
+
+                params["fnames"] = avi_files
+                params["fr"] = sampling_rate
+                params["is3D"] = False
+                if "indices" in params:
+                    params["motion"] = {
+                        "indices": (
+                            slice(*params.get("indices")[0]),
+                            slice(*params.get("indices")[1]),
+                        )
                     }
-                    if cnm.params.get("motion", "pw_rigid"):
-                        mc_results["b0"] = np.ceil(
-                            np.max(np.abs(mc.shifts_rig))
-                        ).astype(int)
-                        cnm.estimates.shifts = mc.shifts_rig
-                        if cnm.params.get("motion", "is3D"):
-                            cnm.estimates.shifts = [
-                                mc.x_shifts_els,
-                                mc.y_shifts_els,
-                                mc.z_shifts_els,
-                            ]
-                        else:
-                            cnm.estimates.shifts = [mc.x_shifts_els, mc.y_shifts_els]
-                    else:
-                        mc_results["b0"] = np.ceil(
-                            np.max(np.abs(mc.shifts_rig))
-                        ).astype(int)
-                        cnm.estimates.shifts = mc.shifts_rig
+                else:
+                    params["motion"] = {"indices": (slice(None), slice(None))}
 
-                    base_name = pathlib.Path(fnames[0]).stem
-                    fname_mc = (
-                        mc.fname_tot_els
-                        if cnm.params.motion["pw_rigid"]
-                        else mc.fname_tot_rig
-                    )
-                    if all(fname_mc):
-                        logger.info("Generating C-order memmap file...")
-                        border_to_0 = 0 if mc.border_nan == "copy" else mc.border_to_0
-                        fname_new = cm.mmapping.save_memmap(
-                            fname_mc,
-                            base_name=base_name + "_mc",
-                            order="C",
-                            var_name_hdf5=cnm.params.get("data", "var_name_hdf5"),
-                            border_to_0=border_to_0,
-                        )
-                    else:
-                        logger.info(
-                            "Applying shifts, then generating C-order memmap file..."
-                        )
-                        fname_new = mc.apply_shifts_movie(
-                            fnames,
-                            save_memmap=True,
-                            save_base_name=base_name + "_mc",
-                            order="C",
-                        )
-                        mc.mmap_file = [fname_new]
-                    Yr, dims, T = cm.mmapping.load_memmap(fname_new)
-                    images = np.reshape(Yr.T, [T] + list(dims), order="F")
-                    cnm.mmap_file = fname_new
-                    # terminate the previous cluster and setup a new one with fewer
-                    # processes for CNMF because it is memory intensive
-                    dview.terminate()
-                    n_processes = np.floor(multiprocessing.cpu_count() * 0.2)
-                    n_processes = int(os.getenv("CAIMAN_CNMF_N_PROCESSES", n_processes))
+                @memoized_result(
+                    uniqueness_dict=params,
+                    output_directory=output_dir,
+                )
+                def _run_processing():
+                    mc_indices = params["motion"].get("indices")
+                    caiman_temp = os.environ.get("CAIMAN_TEMP")
+                    os.environ["CAIMAN_TEMP"] = str(output_dir)
+                    n_processes = np.floor(multiprocessing.cpu_count() * 0.6)
+                    n_processes = int(os.getenv("CAIMAN_MC_N_PROCESSES", n_processes))
                     _, dview, n_processes = cm.cluster.setup_cluster(
                         backend="multiprocessing",
                         n_processes=n_processes,
                         maxtasksperchild=1,
                     )
-                    cnm.dview = dview
-                    logger.info(f"Starting CNMF analysis with {n_processes} processes...")
+                    try:
+                        opts = CNMFParams(params_dict=params)
+                        cnm = CNMF(n_processes, params=opts, dview=dview)
+                        fnames = cnm.params.get("data", "fnames")
+                        mc = MotionCorrect(fnames, dview=cnm.dview, **cnm.params.motion)
+                        mc_base_attrs = list(mc.__dict__)
+                        logger.info("Starting motion correction (CaImAn)...")
+                        mc.motion_correct(save_movie=mc_indices is None)
+                        mc_results = {
+                            k: v
+                            for k, v in mc.__dict__.items()
+                            if k not in mc_base_attrs
+                        }
+                        if cnm.params.get("motion", "pw_rigid"):
+                            mc_results["b0"] = np.ceil(
+                                np.max(np.abs(mc.shifts_rig))
+                            ).astype(int)
+                            cnm.estimates.shifts = mc.shifts_rig
+                            if cnm.params.get("motion", "is3D"):
+                                cnm.estimates.shifts = [
+                                    mc.x_shifts_els,
+                                    mc.y_shifts_els,
+                                    mc.z_shifts_els,
+                                ]
+                            else:
+                                cnm.estimates.shifts = [
+                                    mc.x_shifts_els,
+                                    mc.y_shifts_els,
+                                ]
+                        else:
+                            mc_results["b0"] = np.ceil(
+                                np.max(np.abs(mc.shifts_rig))
+                            ).astype(int)
+                            cnm.estimates.shifts = mc.shifts_rig
 
-                    cnm.fit(images, indices=(slice(None), slice(None)))
-                    cnm.estimates.evaluate_components(
-                        images, cnm.params, dview=cnm.dview
-                    )
-                    cnm.estimates.detrend_df_f(quantileMin=8, frames_window=250)
-                    logger.info("Computing summary images...")
-                    correlation_image, _ = cm.summary_images.correlation_pnr(
-                        images[:: max(T // 1000, 1)],
-                        gSig=cnm.params.init["gSig"][0],
-                        swap_dim=False,
-                    )
-                    correlation_image[np.isnan(correlation_image)] = 0
-                    cnm.estimates.Cn = correlation_image
-                    fname_hdf5 = cnm.mmap_file[:-4] + "hdf5"
-                    cnm.save(fname_hdf5)
-                    cnmf_output_file = pathlib.Path(fname_hdf5)
-                    summary_images = {
-                        "average_image": np.mean(images[:: max(T // 1000, 1)], axis=0),
-                        "max_image": np.max(images[:: max(T // 1000, 1)], axis=0),
-                        "correlation_image": correlation_image,
+                        base_name = pathlib.Path(fnames[0]).stem
+                        fname_mc = (
+                            mc.fname_tot_els
+                            if cnm.params.motion["pw_rigid"]
+                            else mc.fname_tot_rig
+                        )
+                        if all(fname_mc):
+                            logger.info("Generating C-order memmap file...")
+                            border_to_0 = (
+                                0 if mc.border_nan == "copy" else mc.border_to_0
+                            )
+                            fname_new = cm.mmapping.save_memmap(
+                                fname_mc,
+                                base_name=base_name + "_mc",
+                                order="C",
+                                var_name_hdf5=cnm.params.get("data", "var_name_hdf5"),
+                                border_to_0=border_to_0,
+                            )
+                        else:
+                            logger.info(
+                                "Applying shifts, then generating C-order memmap file..."
+                            )
+                            fname_new = mc.apply_shifts_movie(
+                                fnames,
+                                save_memmap=True,
+                                save_base_name=base_name + "_mc",
+                                order="C",
+                            )
+                            mc.mmap_file = [fname_new]
+                        Yr, dims, T = cm.mmapping.load_memmap(fname_new)
+                        images = np.reshape(Yr.T, [T] + list(dims), order="F")
+                        cnm.mmap_file = fname_new
+                        # terminate the previous cluster and setup a new one with fewer
+                        # processes for CNMF because it is memory intensive
+                        dview.terminate()
+                        n_processes = np.floor(multiprocessing.cpu_count() * 0.2)
+                        n_processes = int(
+                            os.getenv("CAIMAN_CNMF_N_PROCESSES", n_processes)
+                        )
+                        _, dview, n_processes = cm.cluster.setup_cluster(
+                            backend="multiprocessing",
+                            n_processes=n_processes,
+                            maxtasksperchild=1,
+                        )
+                        cnm.dview = dview
+                        logger.info(
+                            f"Starting CNMF analysis with {n_processes} processes..."
+                        )
+
+                        cnm.fit(images, indices=(slice(None), slice(None)))
+                        cnm.estimates.evaluate_components(
+                            images, cnm.params, dview=cnm.dview
+                        )
+                        cnm.estimates.detrend_df_f(quantileMin=8, frames_window=250)
+                        logger.info("Computing summary images...")
+                        correlation_image, _ = cm.summary_images.correlation_pnr(
+                            images[:: max(T // 1000, 1)],
+                            gSig=cnm.params.init["gSig"][0],
+                            swap_dim=False,
+                        )
+                        correlation_image[np.isnan(correlation_image)] = 0
+                        cnm.estimates.Cn = correlation_image
+                        fname_hdf5 = cnm.mmap_file[:-4] + "hdf5"
+                        cnm.save(fname_hdf5)
+                        cnmf_output_file = pathlib.Path(fname_hdf5)
+                        summary_images = {
+                            "average_image": np.mean(
+                                images[:: max(T // 1000, 1)], axis=0
+                            ),
+                            "max_image": np.max(images[:: max(T // 1000, 1)], axis=0),
+                            "correlation_image": correlation_image,
+                        }
+                        _save_mc(
+                            mc,
+                            cnmf_output_file.as_posix(),
+                            params["is3D"],
+                            summary_images=summary_images,
+                        )
+                    except Exception as e:
+                        dview.terminate()
+                        raise e
+                    else:
+                        cm.stop_server(dview=dview)
+                        logger.info("CNMF analysis complete. Resulted saved.")
+                        caiman_temp = os.environ.get("CAIMAN_TEMP")
+                        if caiman_temp is not None:
+                            os.environ["CAIMAN_TEMP"] = caiman_temp
+                        else:
+                            del os.environ["CAIMAN_TEMP"]
+
+                _run_processing()
+                _, imaging_dataset = get_loader_result(
+                    key, ProcessingTask, full_output_dir=output_dir
+                )
+                caiman_dataset = imaging_dataset
+                key["processing_time"] = caiman_dataset.creation_time
+                key["package_version"] = cm.__version__
+                file_entries = [
+                    {
+                        **key,
+                        "file_name": f.relative_to(
+                            get_processed_root_data_dir()
+                        ).as_posix(),
+                        "file": f.as_posix(),
                     }
-                    _save_mc(
-                        mc,
-                        cnmf_output_file.as_posix(),
-                        params["is3D"],
-                        summary_images=summary_images,
+                    for f in output_dir.rglob("*")
+                    if f.is_file()
+                ]
+
+            elif method == "minian":
+                import multiprocessing
+                import psutil
+                from dask.distributed import Client, LocalCluster
+                from minian.cnmf import (
+                    compute_AtC,
+                    compute_trace,
+                    get_noise_fft,
+                    smooth_sig,
+                    unit_merge,
+                    update_spatial,
+                    update_temporal,
+                    update_background,
+                )
+                from minian.initialization import (
+                    gmm_refine,
+                    initA,
+                    initC,
+                    intensity_refine,
+                    ks_refine,
+                    pnr_refine,
+                    seeds_init,
+                    seeds_merge,
+                )
+                from minian.motion_correction import apply_transform, estimate_motion
+                from minian.preprocessing import denoise, remove_background
+
+                from minian.utilities import (
+                    TaskAnnotation,
+                    get_optimal_chk,
+                    load_videos,
+                    open_minian,
+                    save_minian,
+                )
+                from minian.visualization import (
+                    CNMFViewer,
+                    export_plot,
+                    VArrayViewer,
+                    generate_videos,
+                    visualize_gmm_fit,
+                    visualize_motion,
+                    visualize_preprocess,
+                    visualize_seeds,
+                    visualize_spatial_update,
+                    visualize_temporal_update,
+                    write_video,
+                )
+
+                # Setup Dask cluster with env vars or auto-config
+                n_workers = int(
+                    os.getenv(
+                        "MINIAN_NWORKERS",
+                        max(1, int(multiprocessing.cpu_count() * 0.8)),
+                    )
+                )
+                memory_total = psutil.virtual_memory().total
+                memory_per_worker = int(memory_total * 0.8 / n_workers / 1e9)
+                memory_limit = os.getenv(
+                    "MINIAN_MEMORY_LIMIT", f"{memory_per_worker}GB"
+                )
+
+                # Set intermediate storage path
+                temp_path = str(output_dir / "intermediate")
+                os.makedirs(temp_path, exist_ok=True)
+                os.environ["MINIAN_INTERMEDIATE"] = temp_path
+
+                # Start Dask cluster
+                logger.info(
+                    f"Starting Minian processing with {n_workers} workers, {memory_limit} memory limit..."
+                )
+                cluster = LocalCluster(
+                    n_workers=n_workers,
+                    memory_limit=memory_limit,
+                    resources={"MEM": 1},
+                    threads_per_worker=2,
+                    dashboard_address=None,  # Disable dashboard in automated pipeline
+                )
+                annotation_plugin = TaskAnnotation()
+                cluster.scheduler.add_plugin(annotation_plugin)
+                client = Client(cluster)
+
+                try:
+
+                    # ===== LOAD VIDEOS =====
+                    logger.info("Loading videos...")
+                    param_load_videos = params.get(
+                        "param_load_videos",
+                        {"pattern": "r'.*\.avi$'", "downsample_strategy": "subset"},
+                    )
+                    video_array = load_videos(
+                        str(avi_files[0].parent), **param_load_videos
+                    )
+                    chunk_size, _ = get_optimal_chk(video_array, dtype=float)
+                    video_array = video_array.chunk(
+                        {"frame": chunk_size["frame"], "height": -1, "width": -1}
+                    )
+
+                    # ===== PREPROCESSING =====
+                    logger.info("Preprocessing: glow removal...")
+                    subset = None
+                    video_array_base_ref = video_array.sel(subset)
+                    video_min_removed = video_array_base_ref.min("frame").compute()
+                    video_array_ref = video_array_base_ref - video_min_removed
+                    logger.info("Preprocessing: denoising...")
+                    param_denoise = params.get(
+                        "param_denoise", {"method": "median", "ksize": 7}
+                    )
+                    video_array_denoised = denoise(video_array_ref, **param_denoise)
+
+                    logger.info("Preprocessing: background removal...")
+                    param_background_removal = params.get(
+                        "param_background_removal", {"method": "tophat", "wnd": 10}
+                    )
+                    video_array_bg_removed = remove_background(
+                        video_array_denoised, **param_background_removal
+                    )
+
+                    logger.info("Preprocessing: saving pre-processed video...")
+                    video_array_preprocessed = save_minian(
+                        video_array_bg_removed.rename("video_array_preprocessed"),
+                        dpath=temp_path,
+                        overwrite=True,
+                    )
+
+                    # ===== MOTION CORRECTION =====
+                    logger.info("Estimating motion...")
+                    param_estimate_motion = params.get(
+                        "param_estimate_motion", {"dim": "frame"}
+                    )
+                    motion = estimate_motion(
+                        video_array_preprocessed, **param_estimate_motion
+                    )
+                    motion = save_minian(
+                        motion.rename("motion"), dpath=temp_path, overwrite=True
+                    )
+
+                    logger.info("Applying motion correction...")
+                    Y = apply_transform(video_array_preprocessed, motion, fill=0)
+                    Y_fm_chk = save_minian(
+                        Y.astype(float).rename("Y_fm_chk"), temp_path, overwrite=True
+                    )
+                    Y_hw_chk = save_minian(
+                        Y_fm_chk.rename("Y_hw_chk"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={
+                            "frame": -1,
+                            "height": chunk_size["height"],
+                            "width": chunk_size["width"],
+                        },
+                    )
+                    write_video(Y_fm_chk, "motion_corrected_movie.mp4", output_dir)
+
+                    logger.info("Motion Correction: Create and save max projection...")
+                    max_proj = Y_fm_chk.max("frame").compute()
+                    max_proj = save_minian(
+                        max_proj.rename("max_proj"),
+                        **{"dpath": output_dir, "overwrite": True},
+                    )
+
+                    # ===== INITIALIZATION =====
+                    logger.info("Initializing seeds...")
+                    param_seeds_init = params.get("param_seeds_init", {})
+                    seeds = seeds_init(Y_fm_chk, **param_seeds_init)
+
+                    logger.info("Refining seeds with PNR...")
+                    param_pnr_refine = params.get("param_pnr_refine", {})
+                    seeds, pnr, gmm = pnr_refine(Y_hw_chk, seeds, **param_pnr_refine)
+
+                    logger.info("Refining seeds with KS test...")
+                    param_ks_refine = params.get("param_ks_refine", {})
+                    seeds = ks_refine(Y_hw_chk, seeds, **param_ks_refine)
+
+                    logger.info("Merging seeds...")
+                    param_seeds_merge = params.get("param_seeds_merge", {})
+                    seeds_final = seeds[
+                        seeds["mask_ks"] & seeds["mask_pnr"]
+                    ].reset_index(drop=True)
+                    seeds_final = seeds_merge(
+                        Y_hw_chk, max_proj, seeds_final, **param_seeds_merge
+                    )
+
+                    logger.info(
+                        "Initializing spatial footprints (A) and temporal traces (C)..."
+                    )
+                    param_initialize = params.get("param_initialize", {})
+                    A_init = initA(
+                        Y_hw_chk,
+                        seeds_final[seeds_final["mask_mrg"]],
+                        **param_initialize,
+                    )
+                    A_init = save_minian(
+                        A_init.rename("A_init"), temp_path, overwrite=True
+                    )
+
+                    C_init = initC(Y_fm_chk, A_init)
+                    C_init = save_minian(
+                        C_init.rename("C_init"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": 1, "frame": -1},
+                    )
+
+                    # Initial merge
+                    logger.info("Merging initial components...")
+                    param_init_merge = params.get("param_init_merge", {})
+                    A, C = unit_merge(A_init, C_init, **param_init_merge)
+                    A = save_minian(A.rename("A"), temp_path, overwrite=True)
+                    C = save_minian(C.rename("C"), temp_path, overwrite=True)
+                    C_chk = save_minian(
+                        C.rename("C_chk"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": -1, "frame": chunk_size["frame"]},
+                    )
+
+                    # ===== CNMF - FIRST ITERATION =====
+                    logger.info("CNMF: Computing noise statistics...")
+                    param_get_noise = params.get("param_get_noise", {})
+                    sn_spatial = get_noise_fft(Y_hw_chk, **param_get_noise)
+                    sn_spatial = save_minian(
+                        sn_spatial.rename("sn_spatial"), temp_path, overwrite=True
+                    )
+
+                    # Initialize background
+                    logger.info("CNMF: Initializing background...")
+                    b, f = update_background(Y_fm_chk, A, C_chk)
+                    b = save_minian(b.rename("b"), temp_path, overwrite=True)
+                    f = save_minian(f.rename("f"), temp_path, overwrite=True)
+
+                    # First spatial update
+                    logger.info("CNMF: First spatial update...")
+                    param_first_spatial = params.get("param_first_spatial", {})
+                    A_new, mask_spatial = update_spatial(
+                        Y_hw_chk, A, C, sn_spatial, **param_first_spatial
+                    )
+                    A = save_minian(
+                        A_new.rename("A"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": 1, "height": -1, "width": -1},
+                    )
+
+                    # First temporal update
+                    logger.info("CNMF: First temporal update...")
+                    param_first_temporal = params.get("param_first_temporal", {})
+                    YrA = compute_trace(Y_fm_chk, A, b, C_chk, f)
+                    YrA = save_minian(
+                        YrA.rename("YrA"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": 1, "frame": -1},
+                    )
+                    C_new, S_new, b0_new, c0_new, g, mask_temporal = update_temporal(
+                        A, C, YrA=YrA, **param_first_temporal
+                    )
+                    C = save_minian(
+                        C_new.rename("C").chunk({"unit_id": 1, "frame": -1}),
+                        temp_path,
+                        overwrite=True,
+                    )
+                    C_chk = save_minian(
+                        C.rename("C_chk"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": -1, "frame": chunk_size["frame"]},
+                    )
+                    S = save_minian(
+                        S_new.rename("S").chunk({"unit_id": 1, "frame": -1}),
+                        temp_path,
+                        overwrite=True,
+                    )
+                    b0 = save_minian(
+                        b0_new.rename("b0").chunk({"unit_id": 1, "frame": -1}),
+                        temp_path,
+                        overwrite=True,
+                    )
+                    c0 = save_minian(
+                        c0_new.rename("c0").chunk({"unit_id": 1, "frame": -1}),
+                        temp_path,
+                        overwrite=True,
+                    )
+
+                    # First merge
+                    logger.info("CNMF: Merging after first iteration...")
+                    param_first_merge = params.get("param_first_merge", {})
+                    A, C = unit_merge(A, C, **param_first_merge)
+                    A = save_minian(A.rename("A"), temp_path, overwrite=True)
+                    C = save_minian(C.rename("C"), temp_path, overwrite=True)
+                    C_chk = save_minian(
+                        C.rename("C_chk"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": -1, "frame": chunk_size["frame"]},
+                    )
+
+                    # ===== CNMF - SECOND ITERATION =====
+                    # Second spatial update
+                    logger.info("CNMF: Second spatial update...")
+                    param_second_spatial = params.get("param_second_spatial", {})
+                    A_new, mask_spatial = update_spatial(
+                        Y_hw_chk, A, C, sn_spatial, **param_second_spatial
+                    )
+                    A = save_minian(
+                        A_new.rename("A"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": 1, "height": -1, "width": -1},
+                    )
+                    b_new, f_new = update_background(Y_fm_chk, A, C_chk)
+                    b = save_minian(b_new.rename("b"), temp_path, overwrite=True)
+                    f = save_minian(
+                        f_new.chunk({"frame": chunk_size["frame"]}).rename("f"),
+                        temp_path,
+                        overwrite=True,
+                    )
+
+                    # Second temporal update
+                    logger.info("CNMF: Second temporal update...")
+                    param_second_temporal = params.get("param_second_temporal", {})
+                    YrA = compute_trace(Y_fm_chk, A, b, C_chk, f)
+                    YrA = save_minian(
+                        YrA.rename("YrA"),
+                        temp_path,
+                        overwrite=True,
+                        chunks={"unit_id": 1, "frame": -1},
+                    )
+                    C_new, S_new, b0_new, c0_new, g, mask_temporal = update_temporal(
+                        A, C, YrA=YrA, **param_second_temporal
+                    )
+
+                    # Apply temporal mask to keep only valid units
+                    A = A.sel(unit_id=C_new.coords["unit_id"].values)
+
+                    # ===== SAVE FINAL RESULTS =====
+                    logger.info("Saving final results...")
+                    A = save_minian(
+                        A.rename("A"), **{"dpath": output_dir, "overwrite": True}
+                    )
+                    C = save_minian(
+                        C_new.rename("C"), **{"dpath": output_dir, "overwrite": True}
+                    )
+                    S = save_minian(
+                        S_new.rename("S"), **{"dpath": output_dir, "overwrite": True}
+                    )
+                    c0 = save_minian(
+                        c0_new.rename("c0"), **{"dpath": output_dir, "overwrite": True}
+                    )
+                    b0 = save_minian(
+                        b0_new.rename("b0"), **{"dpath": output_dir, "overwrite": True}
+                    )
+                    b = save_minian(
+                        b_new.rename("b"), **{"dpath": output_dir, "overwrite": True}
+                    )
+                    f = save_minian(
+                        f_new.rename("f"), **{"dpath": output_dir, "overwrite": True}
+                    )
+                    motion = save_minian(
+                        motion.rename("motion"),
+                        **{"dpath": output_dir, "overwrite": True},
+                    )
+                    logger.info(
+                        f"Minian processing complete. {A.sizes['unit_id']} units detected."
                     )
                 except Exception as e:
-                    dview.terminate()
+                    client.close()
+                    cluster.close()
+                    logger.error(f"Minian processing failed: {e}")
                     raise e
-                else:
-                    cm.stop_server(dview=dview)
-                    logger.info("CNMF analysis complete. Resulted saved.")
-                    caiman_temp = os.environ.get("CAIMAN_TEMP")
-                    if caiman_temp is not None:
-                        os.environ["CAIMAN_TEMP"] = caiman_temp
-                    else:
-                        del os.environ["CAIMAN_TEMP"]
+                finally:
+                    client.close()
+                    cluster.close()
+                # Load results and prepare for insertion
+                minian_loader = MinianLoader(output_dir)
+                key["processing_time"] = minian_loader.creation_time
 
-            _run_processing()
-            _, imaging_dataset = get_loader_result(
-                key, ProcessingTask, full_output_dir=output_dir
-            )
-            caiman_dataset = imaging_dataset
-            key["processing_time"] = caiman_dataset.creation_time
-            key["package_version"] = cm.__version__
-            file_entries = [
-                {
-                    **key,
-                    "file_name": f.relative_to(
-                        get_processed_root_data_dir()
-                    ).as_posix(),
-                    "file": f.as_posix(),
-                }
-                for f in output_dir.rglob("*")
-                if f.is_file()
-            ]
+                # Get minian version if available
+                try:
+                    import minian
+
+                    key["package_version"] = getattr(minian, "__version__", "")
+                except (ImportError, AttributeError):
+                    key["package_version"] = ""
+
+                file_entries = [
+                    {
+                        **key,
+                        "file_name": f.name,
+                        "file": f.as_posix(),
+                    }
+                    for f in output_dir.rglob("*")
+                    if f.is_file()
+                ]
+
         else:
             raise ValueError(f"Unknown task mode: {task_mode}")
         return (file_entries, output_dir)
@@ -1131,6 +1550,38 @@ class MotionCorrection(dj.Imported):
             }
             self.Summary.insert1(summary_images)
 
+        elif method == "minian":
+            minian_dataset = loaded_result
+
+            self.insert1(
+                {**key, "motion_correct_channel": minian_dataset.alignment_channel}
+            )
+
+            # Minian uses rigid motion correction
+            rigid_correction = minian_dataset.extract_rigid_mc()
+            if rigid_correction is not None:
+                rigid_correction.update(**key)
+                self.RigidMotionCorrection.insert1(rigid_correction)
+
+            # -- summary images --
+            ref_image = minian_dataset.ref_image
+            mean_image = minian_dataset.mean_image
+            max_proj_image = minian_dataset.max_proj_image
+            correlation_image = minian_dataset.correlation_map
+
+            summary_images = {
+                **key,
+                "ref_image": (
+                    ref_image if ref_image is not None else np.zeros((1, 1, 1))
+                ),
+                "average_image": (
+                    mean_image if mean_image is not None else np.zeros((1, 1, 1))
+                ),
+                "correlation_image": correlation_image,
+                "max_proj_image": max_proj_image,
+            }
+            self.Summary.insert1(summary_images)
+
         else:
             raise NotImplementedError("Unknown/unimplemented method: {}".format(method))
 
@@ -1238,6 +1689,57 @@ class Segmentation(dj.Computed):
                     cells, ignore_extra_fields=True, allow_direct_insert=True
                 )
 
+        elif method == "minian":
+            minian_dataset = loaded_result
+
+            # infer "segmentation_channel" - from params if available, else from minian loader
+            params = (ProcessingParamSet * ProcessingTask & key).fetch1("params")
+            segmentation_channel = params.get(
+                "segmentation_channel", minian_dataset.segmentation_channel
+            )
+
+            masks, cells = [], []
+            for mask in minian_dataset.masks:
+                masks.append(
+                    {
+                        **key,
+                        "segmentation_channel": segmentation_channel,
+                        "mask": mask["mask_id"],
+                        "mask_npix": mask["mask_npix"],
+                        "mask_center_x": mask["mask_center_x"],
+                        "mask_center_y": mask["mask_center_y"],
+                        "mask_center_z": mask["mask_center_z"],
+                        "mask_xpix": mask["mask_xpix"],
+                        "mask_ypix": mask["mask_ypix"],
+                        "mask_zpix": mask["mask_zpix"],
+                        "mask_weights": mask["mask_weights"],
+                    }
+                )
+                if mask["accepted"]:
+                    cells.append(
+                        {
+                            **key,
+                            "mask_classification_method": "minian_default_classifier",
+                            "mask": mask["mask_id"],
+                            "mask_type": "soma",
+                        }
+                    )
+
+            self.insert1(key)
+            self.Mask.insert(masks, ignore_extra_fields=True)
+
+            if cells:
+                MaskClassification.insert1(
+                    {
+                        **key,
+                        "mask_classification_method": "minian_default_classifier",
+                    },
+                    allow_direct_insert=True,
+                )
+                MaskClassification.MaskType.insert(
+                    cells, ignore_extra_fields=True, allow_direct_insert=True
+                )
+
         else:
             raise NotImplementedError(f"Unknown/unimplemented method: {method}")
 
@@ -1255,7 +1757,7 @@ class MaskClassificationMethod(dj.Lookup):
     mask_classification_method: varchar(48)
     """
 
-    contents = zip(["caiman_default_classifier"])
+    contents = zip(["caiman_default_classifier", "minian_default_classifier"])
 
 
 @schema
@@ -1360,6 +1862,29 @@ class Fluorescence(dj.Computed):
             self.insert1(key)
             self.Trace.insert(fluo_traces)
 
+        elif method == "minian":
+            minian_dataset = loaded_result
+
+            # infer "segmentation_channel" - from params if available, else from minian loader
+            params = (ProcessingParamSet * ProcessingTask & key).fetch1("params")
+            segmentation_channel = params.get(
+                "segmentation_channel", minian_dataset.segmentation_channel
+            )
+
+            fluo_traces = []
+            for mask in minian_dataset.masks:
+                fluo_traces.append(
+                    {
+                        **key,
+                        "mask": mask["mask_id"],
+                        "fluorescence_channel": segmentation_channel,
+                        "fluorescence": mask["inferred_trace"],
+                    }
+                )
+
+            self.insert1(key)
+            self.Trace.insert(fluo_traces)
+
         else:
             raise NotImplementedError("Unknown/unimplemented method: {}".format(method))
 
@@ -1369,14 +1894,14 @@ class ActivityExtractionMethod(dj.Lookup):
     """Lookup table for activity extraction methods.
 
     Attributes:
-        extraction_method (foreign key, varchar(32) ): Extraction method from CaImAn.
+        extraction_method (foreign key, varchar(32) ): Extraction method from CaImAn or Minian.
     """
 
     definition = """
     extraction_method: varchar(32)
     """
 
-    contents = zip(["caiman_deconvolution", "caiman_dff"])
+    contents = zip(["caiman_deconvolution", "caiman_dff", "minian_deconvolution"])
 
 
 @schema
@@ -1421,7 +1946,15 @@ class Activity(dj.Computed):
             & 'extraction_method LIKE "caiman%"'
         )
 
-        return caiman_key_source.proj()
+        minian_key_source = (
+            Fluorescence
+            * ActivityExtractionMethod
+            * ProcessingParamSet.proj("processing_method")
+            & 'processing_method = "minian"'
+            & 'extraction_method LIKE "minian%"'
+        )
+
+        return caiman_key_source.proj() + minian_key_source.proj()
 
     def make(self, key):
         """Populates table with activity trace data."""
@@ -1454,6 +1987,28 @@ class Activity(dj.Computed):
                         activity_trace=mask[attr_mapper[key["extraction_method"]]],
                     )
                     for mask in caiman_dataset.masks
+                )
+
+        elif method == "minian":
+            minian_dataset = loaded_result
+
+            if key["extraction_method"] == "minian_deconvolution":
+                # infer "segmentation_channel" - from params if available, else from minian loader
+                params = (ProcessingParamSet * ProcessingTask & key).fetch1("params")
+                segmentation_channel = params.get(
+                    "segmentation_channel", minian_dataset.segmentation_channel
+                )
+
+                self.insert1(key)
+                self.Trace.insert(
+                    dict(
+                        key,
+                        mask=mask["mask_id"],
+                        fluorescence_channel=segmentation_channel,
+                        activity_trace=mask["spikes"],
+                    )
+                    for mask in minian_dataset.masks
+                    if "spikes" in mask
                 )
 
         else:
@@ -1526,6 +2081,181 @@ class ProcessingQualityMetrics(dj.Computed):
 # Helper Functions ---------------------------------------------------------------------
 
 
+class MinianLoader:
+    """Loader class for Minian analysis results.
+
+    Provides a consistent interface for accessing Minian outputs similar to CaImAn loader.
+    """
+
+    def __init__(self, output_dir):
+        """Initialize the MinianLoader.
+
+        Args:
+            output_dir: Path to the directory containing Minian zarr outputs.
+        """
+        from minian.utilities import open_minian
+
+        self.output_dir = pathlib.Path(output_dir)
+        self._minian_ds = open_minian(str(self.output_dir))
+
+        # Load core arrays
+        self._A = self._minian_ds.get(
+            "A"
+        )  # Spatial footprints (unit_id, height, width)
+        self._C = self._minian_ds.get("C")  # Temporal traces (unit_id, frame)
+        self._S = self._minian_ds.get(
+            "S"
+        )  # Deconvolved activity/spikes (unit_id, frame)
+        self._b = self._minian_ds.get("b")  # Background spatial (height, width)
+        self._f = self._minian_ds.get("f")  # Background temporal (frame)
+        self._b0 = self._minian_ds.get("b0")  # Baseline (unit_id, frame)
+        self._c0 = self._minian_ds.get("c0")  # Initial calcium (unit_id, frame)
+
+        # Try to load motion correction data
+        self._motion = self._minian_ds.get("motion")
+
+        # Try to load reference/max projection images
+        self._max_proj = self._minian_ds.get("max_proj")
+        self._varr_ref = self._minian_ds.get("varr_ref")
+
+    @property
+    def minian_dataset(self):
+        """Return the raw Minian xarray Dataset."""
+        return self._minian_ds
+
+    @property
+    def creation_time(self):
+        """Get the creation time of the Minian output."""
+        # Use the modification time of the output directory
+        return datetime.fromtimestamp(self.output_dir.stat().st_mtime, tz=timezone.utc)
+
+    @property
+    def alignment_channel(self):
+        """Channel used for motion correction (default 0 for miniscope)."""
+        return 0
+
+    @property
+    def segmentation_channel(self):
+        """Channel used for segmentation (default 0 for miniscope)."""
+        return 0
+
+    @property
+    def is_pw_rigid(self):
+        """Minian uses rigid motion correction by default."""
+        return False
+
+    @property
+    def motion_shifts(self):
+        """Return motion correction shifts as dict with 'x' and 'y' keys."""
+        if self._motion is not None:
+            motion_data = self._motion.compute()
+            return {
+                "x": motion_data.sel(shift_dim="width").values,
+                "y": motion_data.sel(shift_dim="height").values,
+            }
+        return None
+
+    def extract_rigid_mc(self):
+        """Extract rigid motion correction data in format compatible with MotionCorrection table."""
+        shifts = self.motion_shifts
+        if shifts is None:
+            return None
+
+        return {
+            "x_shifts": shifts["x"],
+            "y_shifts": shifts["y"],
+            "x_std": np.std(shifts["x"]),
+            "y_std": np.std(shifts["y"]),
+        }
+
+    @property
+    def ref_image(self):
+        """Return reference image used for motion correction."""
+        if self._varr_ref is not None:
+            # Take mean across frames for reference
+            return self._varr_ref.mean(dim="frame").compute().values[np.newaxis, :, :]
+        return None
+
+    @property
+    def mean_image(self):
+        """Return mean image (average across frames)."""
+        if self._varr_ref is not None:
+            return self._varr_ref.mean(dim="frame").compute().values[np.newaxis, :, :]
+        return None
+
+    @property
+    def max_proj_image(self):
+        """Return maximum projection image."""
+        if self._max_proj is not None:
+            return self._max_proj.compute().values[np.newaxis, :, :]
+        elif self._varr_ref is not None:
+            return self._varr_ref.max(dim="frame").compute().values[np.newaxis, :, :]
+        return None
+
+    @property
+    def correlation_map(self):
+        """Return correlation image (computed during initialization)."""
+        # Minian doesn't store correlation image by default
+        # Return None or compute if needed
+        return None
+
+    @property
+    def masks(self):
+        """Extract mask information in format compatible with Segmentation table.
+
+        Yields dict for each unit with mask properties.
+        """
+        if self._A is None:
+            return []
+
+        A_data = self._A.compute()
+        C_data = self._C.compute() if self._C is not None else None
+        S_data = self._S.compute() if self._S is not None else None
+
+        masks = []
+        for unit_idx, unit_id in enumerate(A_data.coords["unit_id"].values):
+            footprint = A_data.sel(unit_id=unit_id).values
+
+            # Find non-zero pixels
+            mask_indices = np.where(footprint > 0)
+            if len(mask_indices[0]) == 0:
+                continue
+
+            y_pix = mask_indices[0]
+            x_pix = mask_indices[1]
+            weights = footprint[y_pix, x_pix]
+
+            mask_dict = {
+                "mask_id": int(unit_id),
+                "mask_npix": len(x_pix),
+                "mask_center_x": int(np.mean(x_pix)),
+                "mask_center_y": int(np.mean(y_pix)),
+                "mask_center_z": None,
+                "mask_xpix": x_pix,
+                "mask_ypix": y_pix,
+                "mask_zpix": None,
+                "mask_weights": weights,
+                "accepted": True,  # All units accepted (no manual curation)
+            }
+
+            # Add trace data if available
+            if C_data is not None:
+                mask_dict["inferred_trace"] = C_data.sel(unit_id=unit_id).values
+            if S_data is not None:
+                mask_dict["spikes"] = S_data.sel(unit_id=unit_id).values
+
+            masks.append(mask_dict)
+
+        return masks
+
+    @property
+    def num_units(self):
+        """Return number of detected units."""
+        if self._A is not None:
+            return len(self._A.coords["unit_id"])
+        return 0
+
+
 def get_loader_result(key, table, full_output_dir=None) -> tuple:
     """Retrieve the loaded processed imaging results from the loader (e.g. caiman, etc.)
 
@@ -1548,6 +2278,8 @@ def get_loader_result(key, table, full_output_dir=None) -> tuple:
         from element_interface import caiman_loader
 
         loaded_output = caiman_loader.CaImAn(output_dir)
+    elif method == "minian":
+        loaded_output = MinianLoader(output_dir)
     else:
         raise NotImplementedError("Unknown/unimplemented method: {}".format(method))
 
