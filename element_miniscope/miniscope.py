@@ -1002,11 +1002,11 @@ class Processing(dj.Computed):
                 n_workers = int(
                     os.getenv(
                         "MINIAN_NWORKERS",
-                        max(1, int(multiprocessing.cpu_count() * 0.8)),
+                        max(1, int(multiprocessing.cpu_count() * 0.4)),
                     )
                 )
                 memory_total = psutil.virtual_memory().total
-                memory_per_worker = int(memory_total * 0.8 / n_workers / 1e9)
+                memory_per_worker = int(memory_total * 0.4 / n_workers / 1e9)
                 memory_limit = os.getenv(
                     "MINIAN_MEMORY_LIMIT", f"{memory_per_worker}GB"
                 )
