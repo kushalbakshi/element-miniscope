@@ -1315,9 +1315,6 @@ class Processing(dj.Computed):
                     # CNMF ITERATION 1
                     # ========================================
 
-                    # Clean intermediate files that might conflict
-                    clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new", "g", "YrA"])
-
                     # ----- First Spatial Update -----
                     logger.info("CNMF Iteration 1: Spatial update...")
                     param_first_spatial = params.get(
@@ -1374,9 +1371,6 @@ class Processing(dj.Computed):
                     # ========================================
                     # CNMF ITERATION 2
                     # ========================================
-
-                    # Clean intermediate files before second iteration
-                    clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new", "g", "YrA"])
 
                     # ----- Second Spatial Update -----
                     logger.info("CNMF Iteration 2: Spatial update...")
