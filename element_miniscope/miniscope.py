@@ -970,9 +970,75 @@ class Processing(dj.Computed):
             elif method == "minian":
                 import multiprocessing
                 import psutil
+                import shutil
                 from dask.distributed import Client, LocalCluster
+
+                # ===== APPLY COMPATIBILITY PATCHES =====
+                # Fix for NetworkX 3.0+ API changes
+                import networkx as nx
+                import scipy.sparse
+                from scipy.sparse import issparse
+                import minian.cnmf as cnmf_module
+
+                def label_connected_fixed(adj, only_connected=False):
+                    """Fixed label_connected for NetworkX 3.0+ compatibility."""
+                    if issparse(adj):
+                        adj = adj.toarray()
+                    adj = adj.copy()
+                    np.fill_diagonal(adj, 0)
+                    adj = np.triu(adj)
+                    g = nx.from_numpy_array(adj)
+                    labels = np.zeros(adj.shape[0], dtype=int)
+                    for icomp, comp in enumerate(nx.connected_components(g)):
+                        for node in comp:
+                            labels[node] = icomp
+                    if only_connected:
+                        iso_mask = np.array([len(c) == 1 for c in nx.connected_components(g)])
+                        labels[np.isin(labels, np.where(iso_mask)[0])] = -1
+                    return labels
+
+                cnmf_module.label_connected = label_connected_fixed
+
+                # Fix for sparse array auto-densification
+                import sparse.numba_backend._sparse_array as sparse_mod
+                sparse_mod.AUTO_DENSIFY = True
+
+                # Patch update_temporal to handle sparse.COO arrays
+                _original_update_temporal = cnmf_module.update_temporal
+
+                def patched_update_temporal(A, C, b=None, f=None, Y=None, YrA=None, 
+                                            noise_freq=0.25, p=2, add_lag="p", jac_thres=0.1, 
+                                            sparse_penal=1, bseg=None, med_wd=None, 
+                                            zero_thres=1e-8, max_iters=200, use_smooth=True, 
+                                            normalize=True, warm_start=False, post_scal=False, 
+                                            scs_fallback=False, concurrent_update=False):
+                    """Patched update_temporal that handles sparse.COO arrays properly."""
+                    _original_csc_matrix = scipy.sparse.csc_matrix
+
+                    class PatchedCSCMatrix(scipy.sparse.csc_matrix):
+                        def __new__(cls, arg1, shape=None, dtype=None, copy=False):
+                            if hasattr(arg1, 'todense'):
+                                arg1 = arg1.todense()
+                            return _original_csc_matrix(arg1, shape=shape, dtype=dtype, copy=copy)
+
+                    scipy.sparse.csc_matrix = PatchedCSCMatrix
+                    try:
+                        result = _original_update_temporal(
+                            A, C, b=b, f=f, Y=Y, YrA=YrA, noise_freq=noise_freq,
+                            p=p, add_lag=add_lag, jac_thres=jac_thres, sparse_penal=sparse_penal,
+                            bseg=bseg, med_wd=med_wd, zero_thres=zero_thres, max_iters=max_iters,
+                            use_smooth=use_smooth, normalize=normalize, warm_start=warm_start,
+                            post_scal=post_scal, scs_fallback=scs_fallback, 
+                            concurrent_update=concurrent_update
+                        )
+                    finally:
+                        scipy.sparse.csc_matrix = _original_csc_matrix
+                    return result
+
+                cnmf_module.update_temporal = patched_update_temporal
+
+                # Now import minian modules (after patches are applied)
                 from minian.cnmf import (
-                    compute_trace,
                     get_noise_fft,
                     unit_merge,
                     update_spatial,
@@ -996,12 +1062,10 @@ class Processing(dj.Computed):
                     save_minian,
                 )
                 from minian.visualization import write_video
-                
 
                 # ===== CONTAINER-AWARE MEMORY DETECTION =====
                 def get_container_memory_limit():
                     """Get memory limit respecting container cgroups (v1 and v2)."""
-                    # Try cgroup v2 first (modern Docker/Kubernetes)
                     try:
                         with open("/sys/fs/cgroup/memory.max") as f:
                             limit = f.read().strip()
@@ -1009,16 +1073,13 @@ class Processing(dj.Computed):
                                 return int(limit)
                     except (FileNotFoundError, PermissionError):
                         pass
-                    # Try cgroup v1 (older Docker)
                     try:
                         with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
                             limit = int(f.read().strip())
-                            # cgroup v1 returns a very large number if unlimited
                             if limit < 9223372036854771712:
                                 return limit
                     except (FileNotFoundError, PermissionError):
                         pass
-                    # Fall back to psutil (bare metal or unrestricted container)
                     return psutil.virtual_memory().total
 
                 # ===== DASK CLUSTER CONFIGURATION =====
@@ -1026,10 +1087,9 @@ class Processing(dj.Computed):
                 n_workers = int(
                     os.getenv(
                         "MINIAN_NWORKERS",
-                        max(1, min(int(multiprocessing.cpu_count() * 0.4), 8)),  # Cap at 8 workers
+                        max(1, min(int(multiprocessing.cpu_count() * 0.4), 8)),
                     )
                 )
-                # Reserve 20% for system overhead, distribute rest among workers
                 memory_per_worker = int(memory_total * 0.8 / n_workers)
 
                 memory_limit_env = os.getenv("MINIAN_MEMORY_LIMIT")
@@ -1047,6 +1107,14 @@ class Processing(dj.Computed):
                 os.makedirs(temp_path, exist_ok=True)
                 os.environ["MINIAN_INTERMEDIATE"] = temp_path
 
+                # Helper function to clean intermediate files
+                def clean_intermediate_files(file_names):
+                    """Remove intermediate zarr files to avoid conflicts."""
+                    for fname in file_names:
+                        path = os.path.join(temp_path, f"{fname}.zarr")
+                        if os.path.exists(path):
+                            shutil.rmtree(path)
+
                 # Start Dask cluster
                 logger.info(
                     f"Starting Minian processing with {n_workers} workers, "
@@ -1057,7 +1125,7 @@ class Processing(dj.Computed):
                     memory_limit=memory_limit,
                     resources={"MEM": 1},
                     threads_per_worker=2,
-                    dashboard_address=None,  # Disable dashboard in automated pipeline
+                    dashboard_address=None,
                 )
                 annotation_plugin = TaskAnnotation()
                 cluster.scheduler.add_plugin(annotation_plugin)
@@ -1076,89 +1144,83 @@ class Processing(dj.Computed):
                         **default_load_params,
                         **params.get("param_load_videos", {}),
                     }
-                    video_array = load_videos(
+                    varr = load_videos(
                         str(pathlib.Path(avi_files[0]).parent), **param_load_videos
                     )
-                    chunk_size, _ = get_optimal_chk(video_array, dtype=float)
-                    video_array = save_minian(
-                        video_array.chunk(
-                            {"frame": chunk_size["frame"], "height": -1, "width": -1}
-                        ).rename("video_array"),
+                    chk, _ = get_optimal_chk(varr, dtype=float)
+
+                    # Save raw video to zarr
+                    logger.info("Saving raw video to zarr...")
+                    varr = save_minian(
+                        varr.chunk({"frame": chk["frame"], "height": -1, "width": -1}).rename("varr"),
                         temp_path,
                         overwrite=True,
                     )
                     logger.info(
-                        f"Loaded video: {video_array.sizes['frame']} frames, "
-                        f"{video_array.sizes['height']}x{video_array.sizes['width']} pixels"
+                        f"Loaded video: {varr.sizes['frame']} frames, "
+                        f"{varr.sizes['height']}x{varr.sizes['width']} pixels"
                     )
 
                     # ===== PREPROCESSING =====
-                    logger.info("Preprocessing: glow removal (subtracting minimum)...")
-                    video_min = video_array.min("frame").compute()
-                    video_array_ref = video_array - video_min
+                    logger.info("Preprocessing: glow removal...")
+                    varr_min = varr.min("frame").compute()
+                    varr_ref = varr - varr_min
+                    varr_ref = varr_ref.clip(min=0)
 
                     logger.info("Preprocessing: denoising...")
                     param_denoise = params.get(
                         "param_denoise", {"method": "median", "ksize": 7}
                     )
-                    video_array_ref = denoise(video_array_ref, **param_denoise)
+                    varr_ref = denoise(varr_ref, **param_denoise)
 
                     logger.info("Preprocessing: background removal...")
                     param_background_removal = params.get(
                         "param_background_removal", {"method": "tophat", "wnd": 10}
                     )
-                    video_array_ref = remove_background(video_array_ref, **param_background_removal)
+                    varr_ref = remove_background(varr_ref, **param_background_removal)
 
-                    logger.info("Preprocessing: saving preprocessed video...")
-                    video_array_ref = save_minian(
-                        video_array_ref.rename("video_array_ref"),
-                        dpath=temp_path,
-                        overwrite=True,
-                    )
+                    # Keep it chunked
+                    varr_ref = varr_ref.chunk({"frame": chk["frame"], "height": -1, "width": -1})
 
                     # ===== MOTION CORRECTION =====
                     logger.info("Estimating motion...")
                     param_estimate_motion = params.get(
                         "param_estimate_motion", {"dim": "frame"}
                     )
-                    motion = estimate_motion(video_array_ref, **param_estimate_motion)
+                    motion = estimate_motion(varr_ref, **param_estimate_motion)
                     motion = save_minian(
-                        motion.rename("motion").chunk({"frame": chunk_size["frame"]}),
-                        dpath=temp_path,
+                        motion.rename("motion").chunk({"frame": chk["frame"]}),
+                        temp_path,
                         overwrite=True,
                     )
 
                     logger.info("Applying motion correction...")
-                    Y = apply_transform(video_array_ref, motion, fill=0)
+                    Y = apply_transform(varr_ref, motion, fill=0)
 
-                    # Save two versions with different chunking strategies
+                    # Save two versions with different chunking
+                    logger.info("Saving motion-corrected video (frame-chunked)...")
                     Y_fm_chk = save_minian(
                         Y.astype(float).rename("Y_fm_chk"),
                         temp_path,
                         overwrite=True,
                     )
+
+                    logger.info("Saving motion-corrected video (spatial-chunked)...")
                     Y_hw_chk = save_minian(
                         Y_fm_chk.rename("Y_hw_chk"),
                         temp_path,
                         overwrite=True,
-                        chunks={
-                            "frame": -1,
-                            "height": chunk_size["height"],
-                            "width": chunk_size["width"],
-                        },
+                        chunks={"frame": -1, "height": chk["height"], "width": chk["width"]},
                     )
 
-                    # Save motion corrected video
-                    logger.info("Saving motion corrected video...")
+                    # Save motion corrected video as mp4
+                    logger.info("Writing motion corrected video...")
                     write_video(Y_fm_chk, "motion_corrected.mp4", str(output_dir))
 
                     # Create and save max projection
-                    logger.info("Creating max projection...")
-                    max_proj = save_minian(
-                        Y_fm_chk.max("frame").rename("max_proj"),
-                        dpath=str(output_dir),
-                        overwrite=True,
-                    ).compute()
+                    logger.info("Computing max projection...")
+                    max_proj = Y_fm_chk.max("frame").compute()
+                    max_proj = save_minian(max_proj.rename("max_proj"), temp_path, overwrite=True)
 
                     # ===== SEED INITIALIZATION =====
                     logger.info("Initializing seeds...")
@@ -1180,24 +1242,22 @@ class Processing(dj.Computed):
                         "param_pnr_refine", {"noise_freq": 0.06, "thres": 1}
                     )
                     seeds, pnr, gmm = pnr_refine(Y_hw_chk, seeds, **param_pnr_refine)
+                    logger.info(f"Seeds after PNR refine: {seeds['mask_pnr'].sum()} / {len(seeds)}")
 
                     logger.info("Refining seeds with KS test...")
                     param_ks_refine = params.get("param_ks_refine", {"sig": 0.05})
                     seeds = ks_refine(Y_hw_chk, seeds, **param_ks_refine)
+                    logger.info(f"Seeds after KS refine: {seeds['mask_ks'].sum()} / {len(seeds)}")
 
                     logger.info("Merging seeds...")
                     param_seeds_merge = params.get(
                         "param_seeds_merge",
                         {"thres_dist": 10, "thres_corr": 0.8, "noise_freq": 0.06},
                     )
-                    seeds_final = seeds[seeds["mask_ks"] & seeds["mask_pnr"]].reset_index(
-                        drop=True
-                    )
-                    seeds_final = seeds_merge(
-                        Y_hw_chk, max_proj, seeds_final, **param_seeds_merge
-                    )
+                    seeds_final = seeds[seeds["mask_ks"] & seeds["mask_pnr"]].reset_index(drop=True)
+                    seeds_final = seeds_merge(Y_hw_chk, max_proj, seeds_final, **param_seeds_merge)
                     n_seeds = seeds_final["mask_mrg"].sum()
-                    logger.info(f"Seeds after filtering and merging: {n_seeds}")
+                    logger.info(f"Seeds after merge: {n_seeds} / {len(seeds_final)}")
 
                     if n_seeds == 0:
                         raise ValueError(
@@ -1210,10 +1270,9 @@ class Processing(dj.Computed):
                     param_initialize = params.get(
                         "param_initialize", {"thres_corr": 0.8, "wnd": 10, "noise_freq": 0.06}
                     )
-                    A_init = initA(
-                        Y_hw_chk, seeds_final[seeds_final["mask_mrg"]], **param_initialize
-                    )
+                    A_init = initA(Y_hw_chk, seeds_final[seeds_final["mask_mrg"]], **param_initialize)
                     A_init = save_minian(A_init.rename("A_init"), temp_path, overwrite=True)
+                    logger.info(f"A_init shape: {A_init.shape}")
 
                     logger.info("Initializing temporal traces (C)...")
                     C_init = initC(Y_fm_chk, A_init)
@@ -1223,6 +1282,7 @@ class Processing(dj.Computed):
                         overwrite=True,
                         chunks={"unit_id": 1, "frame": -1},
                     )
+                    logger.info(f"C_init shape: {C_init.shape}")
 
                     # Initial unit merge
                     logger.info("Initial unit merge...")
@@ -1234,39 +1294,39 @@ class Processing(dj.Computed):
                         C.rename("C_chk"),
                         temp_path,
                         overwrite=True,
-                        chunks={"unit_id": -1, "frame": chunk_size["frame"]},
+                        chunks={"unit_id": -1, "frame": chk["frame"]},
                     )
                     logger.info(f"Units after initial merge: {A.sizes['unit_id']}")
 
                     # ===== INITIALIZE BACKGROUND =====
                     logger.info("Initializing background terms...")
                     b, f = update_background(Y_fm_chk, A, C_chk)
-                    b = save_minian(b.rename("b"), temp_path, overwrite=True)
                     f = save_minian(f.rename("f"), temp_path, overwrite=True)
+                    b = save_minian(b.rename("b"), temp_path, overwrite=True)
+                    logger.info(f"Background initialized - b: {b.shape}, f: {f.shape}")
 
                     # ===== COMPUTE NOISE STATISTICS =====
                     logger.info("Computing noise statistics...")
                     param_get_noise = params.get("param_get_noise", {"noise_range": (0.06, 0.5)})
                     sn_spatial = get_noise_fft(Y_hw_chk, **param_get_noise)
-                    sn_spatial = save_minian(
-                        sn_spatial.rename("sn_spatial"), temp_path, overwrite=True
-                    )
+                    sn_spatial = save_minian(sn_spatial.rename("sn_spatial"), temp_path, overwrite=True)
 
                     # ========================================
                     # CNMF ITERATION 1
                     # ========================================
 
+                    # Clean intermediate files that might conflict
+                    clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new", "g", "YrA"])
+
                     # ----- First Spatial Update -----
                     logger.info("CNMF Iteration 1: Spatial update...")
                     param_first_spatial = params.get(
                         "param_first_spatial",
-                        {"dl_wnd": 5, "sparse_penal": 0.01, "size_thres": (25, None)},
+                        {"dl_wnd": 10, "sparse_penal": 0.01, "size_thres": (25, None)},
                     )
                     A_new, mask, norm_fac = update_spatial(
                         Y_hw_chk, A, C, sn_spatial, **param_first_spatial
                     )
-
-                    # Apply mask and normalization to C (CRITICAL)
                     C_new = save_minian(
                         (C.sel(unit_id=mask) * norm_fac).rename("C_new"),
                         temp_path,
@@ -1277,192 +1337,98 @@ class Processing(dj.Computed):
                         temp_path,
                         overwrite=True,
                     )
+                    logger.info(f"Units after first spatial update: {A_new.sizes['unit_id']}")
 
-                    # Save updated A
-                    A = save_minian(
-                        A_new.rename("A"),
-                        temp_path,
-                        overwrite=True,
-                        chunks={"unit_id": 1, "height": -1, "width": -1},
-                    )
-
-                    # Update background after spatial update
-                    b_new, f_new = update_background(Y_fm_chk, A, C_chk_new)
-                    b = save_minian(b_new.rename("b"), temp_path, overwrite=True)
-                    f = save_minian(
-                        f_new.chunk({"frame": chunk_size["frame"]}).rename("f"),
-                        temp_path,
-                        overwrite=True,
-                    )
-                    C = save_minian(C_new.rename("C"), temp_path, overwrite=True)
-                    C_chk = save_minian(C_chk_new.rename("C_chk"), temp_path, overwrite=True)
-
-                    logger.info(f"Units after first spatial update: {A.sizes['unit_id']}")
+                    # Update background after first spatial
+                    logger.info("Updating background...")
+                    b_new, f_new = update_background(Y_fm_chk, A_new, C_chk_new)
 
                     # ----- First Temporal Update -----
                     logger.info("CNMF Iteration 1: Temporal update...")
-                    YrA = save_minian(
-                        compute_trace(Y_fm_chk, A, b, C_chk, f).rename("YrA"),
-                        temp_path,
-                        overwrite=True,
-                        chunks={"unit_id": 1, "frame": -1},
-                    )
-
                     param_first_temporal = params.get(
                         "param_first_temporal",
                         {
                             "noise_freq": 0.06,
-                            "sparse_penal": 0.5,
+                            "sparse_penal": 1,
                             "p": 1,
                             "add_lag": 20,
                             "jac_thres": 0.2,
                         },
                     )
                     C_new, S_new, b0_new, c0_new, g, mask = update_temporal(
-                        A, C, YrA=YrA, **param_first_temporal
+                        A_new, C_new,
+                        Y=Y_fm_chk,
+                        b=b_new, f=f_new,
+                        **param_first_temporal
                     )
-
-                    # Save temporal results
-                    C = save_minian(
-                        C_new.rename("C").chunk({"unit_id": 1, "frame": -1}),
-                        temp_path,
-                        overwrite=True,
-                    )
-                    C_chk = save_minian(
-                        C.rename("C_chk"),
-                        temp_path,
-                        overwrite=True,
-                        chunks={"unit_id": -1, "frame": chunk_size["frame"]},
-                    )
-                    S = save_minian(
-                        S_new.rename("S").chunk({"unit_id": 1, "frame": -1}),
-                        temp_path,
-                        overwrite=True,
-                    )
-                    b0 = save_minian(
-                        b0_new.rename("b0").chunk({"unit_id": 1, "frame": -1}),
-                        temp_path,
-                        overwrite=True,
-                    )
-                    c0 = save_minian(
-                        c0_new.rename("c0").chunk({"unit_id": 1, "frame": -1}),
-                        temp_path,
-                        overwrite=True,
-                    )
-
-                    # Sync A with C after temporal update drops units
-                    A = A.sel(unit_id=C.coords["unit_id"].values)
-
-                    logger.info(f"Units after first temporal update: {A.sizes['unit_id']}")
+                    logger.info(f"Units after first temporal update: {C_new.sizes['unit_id']}")
 
                     # ----- First Merge -----
                     logger.info("CNMF Iteration 1: Merging units...")
                     param_first_merge = params.get("param_first_merge", {"thres_corr": 0.8})
-                    A_mrg, C_mrg, [sig_mrg] = unit_merge(
-                        A, C, [C + b0 + c0], **param_first_merge
+                    A_mrg, C_mrg, [S_mrg] = unit_merge(
+                        A_new.sel(unit_id=mask), C_new, [S_new], **param_first_merge
                     )
-
-                    A = save_minian(A_mrg.rename("A"), temp_path, overwrite=True)
-                    C = save_minian(C_mrg.rename("C"), temp_path, overwrite=True)
-                    C_chk = save_minian(
-                        C.rename("C_chk"),
-                        temp_path,
-                        overwrite=True,
-                        chunks={"unit_id": -1, "frame": chunk_size["frame"]},
-                    )
-
-                    logger.info(f"Units after first merge: {A.sizes['unit_id']}")
+                    logger.info(f"Units after first merge: {A_mrg.sizes['unit_id']}")
 
                     # ========================================
                     # CNMF ITERATION 2
                     # ========================================
 
+                    # Clean intermediate files before second iteration
+                    clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new", "g", "YrA"])
+
                     # ----- Second Spatial Update -----
                     logger.info("CNMF Iteration 2: Spatial update...")
                     param_second_spatial = params.get(
                         "param_second_spatial",
-                        {"dl_wnd": 5, "sparse_penal": 0.01, "size_thres": (25, None)},
+                        {"dl_wnd": 10, "sparse_penal": 0.01, "size_thres": (25, None)},
                     )
-                    A_new, mask, norm_fac = update_spatial(
-                        Y_hw_chk, A, C, sn_spatial, **param_second_spatial
+                    A_new2, mask2, norm_fac2 = update_spatial(
+                        Y_hw_chk, A_mrg, C_mrg, sn_spatial, **param_second_spatial
                     )
+                    C_new2 = C_mrg.sel(unit_id=mask2) * norm_fac2
+                    logger.info(f"Units after second spatial update: {A_new2.sizes['unit_id']}")
 
-                    # Apply mask and normalization to C
-                    C_new = save_minian(
-                        (C.sel(unit_id=mask) * norm_fac).rename("C_new"),
-                        temp_path,
-                        overwrite=True,
-                    )
-                    C_chk_new = save_minian(
-                        (C_chk.sel(unit_id=mask) * norm_fac).rename("C_chk_new"),
-                        temp_path,
-                        overwrite=True,
-                    )
-
-                    # Save updated A
-                    A = save_minian(
-                        A_new.rename("A"),
-                        temp_path,
-                        overwrite=True,
-                        chunks={"unit_id": 1, "height": -1, "width": -1},
-                    )
-
-                    # Update background
-                    b_new, f_new = update_background(Y_fm_chk, A, C_chk_new)
-                    b = save_minian(b_new.rename("b"), temp_path, overwrite=True)
-                    f = save_minian(
-                        f_new.chunk({"frame": chunk_size["frame"]}).rename("f"),
-                        temp_path,
-                        overwrite=True,
-                    )
-                    C = save_minian(C_new.rename("C"), temp_path, overwrite=True)
-                    C_chk = save_minian(C_chk_new.rename("C_chk"), temp_path, overwrite=True)
-
-                    logger.info(f"Units after second spatial update: {A.sizes['unit_id']}")
+                    # Update background after second spatial
+                    logger.info("Updating background...")
+                    b_new2, f_new2 = update_background(Y_fm_chk, A_new2, C_new2)
 
                     # ----- Second Temporal Update -----
                     logger.info("CNMF Iteration 2: Temporal update...")
-                    YrA = save_minian(
-                        compute_trace(Y_fm_chk, A, b, C_chk, f).rename("YrA"),
-                        temp_path,
-                        overwrite=True,
-                        chunks={"unit_id": 1, "frame": -1},
-                    )
-
                     param_second_temporal = params.get(
                         "param_second_temporal",
                         {
                             "noise_freq": 0.06,
-                            "sparse_penal": 0.5,
+                            "sparse_penal": 1,
                             "p": 1,
                             "add_lag": 20,
-                            "jac_thres": 0.2,
+                            "jac_thres": 0.4,
                         },
                     )
-                    C_new, S_new, b0_new, c0_new, g, mask = update_temporal(
-                        A, C, YrA=YrA, **param_second_temporal
+                    C_final, S_final, b0_final, c0_final, g_final, mask_final = update_temporal(
+                        A_new2, C_new2,
+                        Y=Y_fm_chk,
+                        b=b_new2, f=f_new2,
+                        **param_second_temporal
                     )
-
-                    # Sync A with final C
-                    A = A.sel(unit_id=C_new.coords["unit_id"].values)
-
-                    logger.info(f"Final units after second temporal update: {A.sizes['unit_id']}")
+                    A_final = A_new2.sel(unit_id=mask_final)
+                    logger.info(f"Final units: {A_final.sizes['unit_id']}")
 
                     # ===== SAVE FINAL RESULTS =====
                     logger.info("Saving final results to output directory...")
                     final_save_params = {"dpath": str(output_dir), "overwrite": True}
 
-                    A = save_minian(A.rename("A"), **final_save_params)
-                    C = save_minian(C_new.rename("C"), **final_save_params)
-                    S = save_minian(S_new.rename("S"), **final_save_params)
-                    c0 = save_minian(c0_new.rename("c0"), **final_save_params)
-                    b0 = save_minian(b0_new.rename("b0"), **final_save_params)
-                    b = save_minian(b_new.rename("b"), **final_save_params)
-                    f = save_minian(f_new.rename("f"), **final_save_params)
-                    motion = save_minian(motion.rename("motion"), **final_save_params)
+                    A_final = save_minian(A_final.rename("A"), **final_save_params)
+                    C_final = save_minian(C_final.rename("C"), **final_save_params)
+                    S_final = save_minian(S_final.rename("S"), **final_save_params)
+                    b_final = save_minian(b_new2.rename("b"), **final_save_params)
+                    f_final = save_minian(f_new2.rename("f"), **final_save_params)
+                    motion_final = save_minian(motion.rename("motion"), **final_save_params)
+                    max_proj_final = save_minian(max_proj.rename("max_proj"), **final_save_params)
 
                     logger.info(
-                        f"Minian processing complete. {A.sizes['unit_id']} units detected."
+                        f"Minian processing complete. {A_final.sizes['unit_id']} units detected."
                     )
 
                 except Exception as e:
