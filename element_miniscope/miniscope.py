@@ -1046,6 +1046,30 @@ class Processing(dj.Computed):
                 darr.block = patched_darr_block
                 darr.core.block = patched_darr_block
 
+                # ===== PATCH: sparse/dense concatenation compatibility =====
+                import sparse
+                import sparse.numba_backend._coo.common as _sparse_coo_common
+                import numpy as np
+
+                _original_sparse_concat = _sparse_coo_common.concatenate
+
+                def _patched_sparse_concat(arrays, axis=0):
+                    """Convert any dense arrays to sparse.COO before concatenation."""
+                    converted = []
+                    for arr in arrays:
+                        if isinstance(arr, sparse.SparseArray):
+                            converted.append(arr)
+                        elif isinstance(arr, np.ndarray):
+                            converted.append(sparse.COO.from_numpy(arr))
+                        else:
+                            try:
+                                converted.append(sparse.COO.from_numpy(np.asarray(arr)))
+                            except Exception:
+                                converted.append(arr)
+                    return _original_sparse_concat(converted, axis=axis)
+
+                _sparse_coo_common.concatenate = _patched_sparse_concat
+
                 # Patch update_temporal to handle sparse.COO arrays
                 _original_update_temporal = cnmf_module.update_temporal
 
