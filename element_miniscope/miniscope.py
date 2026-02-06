@@ -971,9 +971,11 @@ class Processing(dj.Computed):
                 import multiprocessing
                 import psutil
                 import shutil
+                import dask.array as darr
                 from dask.distributed import Client, LocalCluster
 
                 # ===== APPLY COMPATIBILITY PATCHES =====
+                
                 # Fix for NetworkX 3.0+ API changes
                 import networkx as nx
                 import scipy.sparse
@@ -1000,8 +1002,49 @@ class Processing(dj.Computed):
                 cnmf_module.label_connected = label_connected_fixed
 
                 # Fix for sparse array auto-densification
+                import sparse
                 import sparse.numba_backend._sparse_array as sparse_mod
                 sparse_mod.AUTO_DENSIFY = True
+
+                # Fix for darr.block with mixed sparse array types
+                _original_darr_block = darr.block
+
+                def patched_darr_block(arrays, allow_unknown_chunksizes=False):
+                    """Patched darr.block that ensures sparse array type consistency."""
+                    def convert_to_coo(arr):
+                        if arr is None:
+                            return arr
+                        if isinstance(arr, sparse.COO):
+                            return arr
+                        if isinstance(arr, sparse.SparseArray):
+                            return sparse.COO(arr)
+                        if isinstance(arr, np.ndarray):
+                            return sparse.COO.from_numpy(arr)
+                        if hasattr(arr, 'todense'):
+                            return sparse.COO.from_numpy(np.asarray(arr.todense()))
+                        return arr
+
+                    def recursive_convert(obj):
+                        if isinstance(obj, list):
+                            return [recursive_convert(item) for item in obj]
+                        elif isinstance(obj, np.ndarray) and obj.dtype == object:
+                            result = np.empty_like(obj)
+                            for idx in np.ndindex(obj.shape):
+                                result[idx] = convert_to_coo(obj[idx])
+                            return result
+                        else:
+                            return convert_to_coo(obj)
+
+                    try:
+                        return _original_darr_block(arrays, allow_unknown_chunksizes=allow_unknown_chunksizes)
+                    except ValueError as e:
+                        if "All arrays must be instances of SparseArray" in str(e):
+                            converted = recursive_convert(arrays)
+                            return _original_darr_block(converted, allow_unknown_chunksizes=allow_unknown_chunksizes)
+                        raise
+
+                darr.block = patched_darr_block
+                darr.core.block = patched_darr_block
 
                 # Patch update_temporal to handle sparse.COO arrays
                 _original_update_temporal = cnmf_module.update_temporal
@@ -1036,6 +1079,8 @@ class Processing(dj.Computed):
                     return result
 
                 cnmf_module.update_temporal = patched_update_temporal
+
+                logger.info("Applied minian compatibility patches (NetworkX, sparse arrays, dask.block)")
 
                 # Now import minian modules (after patches are applied)
                 from minian.cnmf import (
