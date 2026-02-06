@@ -1186,16 +1186,20 @@ class Processing(dj.Computed):
                 else:
                     memory_limit = f"{memory_per_worker // (1024**3)}GB"
 
-                # Set intermediate storage path
-                temp_path = str(output_dir / "intermediate")
-                os.makedirs(temp_path, exist_ok=True)
-                os.environ["MINIAN_INTERMEDIATE"] = temp_path
+                # Set minian intermediate storage paths
+                pre_cnmf_path = str(output_dir / "pre_cnmf")
+                first_cnmf_path = str(output_dir / "first_cnmf")
+                second_cnmf_path = str(output_dir / "second_cnmf")
+                os.makedirs(pre_cnmf_path, exist_ok=True)
+                os.makedirs(first_cnmf_path, exist_ok=True)
+                os.makedirs(second_cnmf_path, exist_ok=True)
+                os.environ["MINIAN_INTERMEDIATE"] = pre_cnmf_path
 
                 # Helper function to clean intermediate files
-                def clean_intermediate_files(file_names):
+                def clean_intermediate_files(directory_path, file_names):
                     """Remove intermediate zarr files to avoid conflicts."""
                     for fname in file_names:
-                        path = os.path.join(temp_path, f"{fname}.zarr")
+                        path = os.path.join(directory_path, f"{fname}.zarr")
                         if os.path.exists(path):
                             shutil.rmtree(path)
 
@@ -1237,7 +1241,7 @@ class Processing(dj.Computed):
                     logger.info("Saving raw video to zarr...")
                     varr = save_minian(
                         varr.chunk({"frame": chk["frame"], "height": -1, "width": -1}).rename("varr"),
-                        temp_path,
+                        pre_cnmf_path,
                         overwrite=True,
                     )
                     logger.info(
@@ -1274,7 +1278,7 @@ class Processing(dj.Computed):
                     motion = estimate_motion(varr_ref, **param_estimate_motion)
                     motion = save_minian(
                         motion.rename("motion").chunk({"frame": chk["frame"]}),
-                        temp_path,
+                        pre_cnmf_path,
                         overwrite=True,
                     )
 
@@ -1285,14 +1289,14 @@ class Processing(dj.Computed):
                     logger.info("Saving motion-corrected video (frame-chunked)...")
                     Y_fm_chk = save_minian(
                         Y.astype(float).rename("Y_fm_chk"),
-                        temp_path,
+                        pre_cnmf_path,
                         overwrite=True,
                     )
 
                     logger.info("Saving motion-corrected video (spatial-chunked)...")
                     Y_hw_chk = save_minian(
                         Y_fm_chk.rename("Y_hw_chk"),
-                        temp_path,
+                        pre_cnmf_path,
                         overwrite=True,
                         chunks={"frame": -1, "height": chk["height"], "width": chk["width"]},
                     )
@@ -1304,7 +1308,7 @@ class Processing(dj.Computed):
                     # Create and save max projection
                     logger.info("Computing max projection...")
                     max_proj = Y_fm_chk.max("frame").compute()
-                    max_proj = save_minian(max_proj.rename("max_proj"), temp_path, overwrite=True)
+                    max_proj = save_minian(max_proj.rename("max_proj"), pre_cnmf_path, overwrite=True)
 
                     # ===== SEED INITIALIZATION =====
                     logger.info("Initializing seeds...")
@@ -1355,14 +1359,14 @@ class Processing(dj.Computed):
                         "param_initialize", {"thres_corr": 0.8, "wnd": 10, "noise_freq": 0.06}
                     )
                     A_init = initA(Y_hw_chk, seeds_final[seeds_final["mask_mrg"]], **param_initialize)
-                    A_init = save_minian(A_init.rename("A_init"), temp_path, overwrite=True)
+                    A_init = save_minian(A_init.rename("A_init"), pre_cnmf_path, overwrite=True)
                     logger.info(f"A_init shape: {A_init.shape}")
 
                     logger.info("Initializing temporal traces (C)...")
                     C_init = initC(Y_fm_chk, A_init)
                     C_init = save_minian(
                         C_init.rename("C_init"),
-                        temp_path,
+                        pre_cnmf_path,
                         overwrite=True,
                         chunks={"unit_id": 1, "frame": -1},
                     )
@@ -1372,11 +1376,11 @@ class Processing(dj.Computed):
                     logger.info("Initial unit merge...")
                     param_init_merge = params.get("param_init_merge", {"thres_corr": 0.8})
                     A, C = unit_merge(A_init, C_init, **param_init_merge)
-                    A = save_minian(A.rename("A"), temp_path, overwrite=True)
-                    C = save_minian(C.rename("C"), temp_path, overwrite=True)
+                    A = save_minian(A.rename("A"), pre_cnmf_path, overwrite=True)
+                    C = save_minian(C.rename("C"), pre_cnmf_path, overwrite=True)
                     C_chk = save_minian(
                         C.rename("C_chk"),
-                        temp_path,
+                        pre_cnmf_path,
                         overwrite=True,
                         chunks={"unit_id": -1, "frame": chk["frame"]},
                     )
@@ -1385,19 +1389,23 @@ class Processing(dj.Computed):
                     # ===== INITIALIZE BACKGROUND =====
                     logger.info("Initializing background terms...")
                     b, f = update_background(Y_fm_chk, A, C_chk)
-                    f = save_minian(f.rename("f"), temp_path, overwrite=True)
-                    b = save_minian(b.rename("b"), temp_path, overwrite=True)
+                    f = save_minian(f.rename("f"), pre_cnmf_path, overwrite=True)
+                    b = save_minian(b.rename("b"), pre_cnmf_path, overwrite=True)
                     logger.info(f"Background initialized - b: {b.shape}, f: {f.shape}")
 
                     # ===== COMPUTE NOISE STATISTICS =====
                     logger.info("Computing noise statistics...")
                     param_get_noise = params.get("param_get_noise", {"noise_range": (0.06, 0.5)})
                     sn_spatial = get_noise_fft(Y_hw_chk, **param_get_noise)
-                    sn_spatial = save_minian(sn_spatial.rename("sn_spatial"), temp_path, overwrite=True)
+                    sn_spatial = save_minian(sn_spatial.rename("sn_spatial"), pre_cnmf_path, overwrite=True)
 
                     # ========================================
                     # CNMF ITERATION 1
                     # ========================================
+                    # clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new",
+                    # "g", "YrA"])
+                    
+                    os.environ["MINIAN_INTERMEDIATE"] = first_cnmf_path
 
                     # ----- First Spatial Update -----
                     logger.info("CNMF Iteration 1: Spatial update...")
@@ -1410,12 +1418,12 @@ class Processing(dj.Computed):
                     )
                     C_new = save_minian(
                         (C.sel(unit_id=mask) * norm_fac).rename("C_new"),
-                        temp_path,
+                        first_cnmf_path,
                         overwrite=True,
                     )
                     C_chk_new = save_minian(
                         (C_chk.sel(unit_id=mask) * norm_fac).rename("C_chk_new"),
-                        temp_path,
+                        first_cnmf_path,
                         overwrite=True,
                     )
                     logger.info(f"Units after first spatial update: {A_new.sizes['unit_id']}")
@@ -1456,6 +1464,8 @@ class Processing(dj.Computed):
                     # CNMF ITERATION 2
                     # ========================================
 
+                    os.environ["MINIAN_INTERMEDIATE"] = second_cnmf_path
+                    
                     # ----- Second Spatial Update -----
                     logger.info("CNMF Iteration 2: Spatial update...")
                     param_second_spatial = params.get(
