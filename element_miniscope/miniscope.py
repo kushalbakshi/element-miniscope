@@ -1070,6 +1070,21 @@ class Processing(dj.Computed):
 
                 _sparse_coo_common.concatenate = _patched_sparse_concat
 
+                # ===== PATCH: sparse/dense concatenation compatibility =====
+                import sparse
+                import numpy as np
+                import sparse.numba_backend._coo.common as _sparse_coo_common
+
+                _original_check = _sparse_coo_common.check_consistent_fill_value
+
+                def _patched_check(arrays):
+                    """Auto-convert any dense arrays to sparse.COO before validation."""
+                    for i, arr in enumerate(arrays):
+                        if not isinstance(arr, sparse.SparseArray):
+                            arrays[i] = sparse.COO.from_numpy(np.asarray(arr))
+                    return _original_check(arrays)
+
+                _sparse_coo_common.check_consistent_fill_value = _patched_check
                 # Patch update_temporal to handle sparse.COO arrays
                 _original_update_temporal = cnmf_module.update_temporal
 
