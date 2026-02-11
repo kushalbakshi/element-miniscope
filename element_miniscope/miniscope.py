@@ -1519,7 +1519,7 @@ class Processing(dj.Computed):
                     cluster.close()
 
                 # Load results and prepare for insertion
-                minian_loader = MinianLoader(output_dir)
+                minian_loader = MinianLoader(minian_data_path)
                 key["processing_time"] = minian_loader.creation_time
 
                 # Get minian version if available
