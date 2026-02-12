@@ -1398,9 +1398,10 @@ class Processing(dj.Computed):
                     # ========================================
                     # CNMF ITERATION 1
                     # ========================================
-                    # clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new",
-                    # "g", "YrA"])
-                    
+
+                    # Clean intermediate files that might conflict
+                    clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new", "g", "YrA"])
+
                     # ----- First Spatial Update -----
                     logger.info("CNMF Iteration 1: Spatial update...")
                     param_first_spatial = params.get(
@@ -1449,15 +1450,29 @@ class Processing(dj.Computed):
                     # ----- First Merge -----
                     logger.info("CNMF Iteration 1: Merging units...")
                     param_first_merge = params.get("param_first_merge", {"thres_corr": 0.8})
-                    A_mrg, C_mrg, [S_mrg] = unit_merge(
-                        A_new.sel(unit_id=mask), C_new, [S_new], **param_first_merge
+
+                    # <<< PATCHED: unit_merge coordinate fix
+                    # update_temporal returns C_new/S_new already filtered by mask internally.
+                    # Sync A with C_new's actual coordinates instead of using the boolean mask,
+                    # which can cause alignment mismatches on large datasets.
+                    A_filtered = A_new.sel(unit_id=C_new.coords["unit_id"].values)
+                    logger.info(
+                        f"Unit sync check — A: {A_filtered.sizes['unit_id']}, "
+                        f"C: {C_new.sizes['unit_id']}, S: {S_new.sizes['unit_id']}"
                     )
+                    A_mrg, C_mrg, [S_mrg] = unit_merge(
+                        A_filtered, C_new, [S_new], **param_first_merge
+                    )
+                    # >>> END PATCH
                     logger.info(f"Units after first merge: {A_mrg.sizes['unit_id']}")
 
                     # ========================================
                     # CNMF ITERATION 2
                     # ========================================
-                    
+
+                    # Clean intermediate files before second iteration
+                    clean_intermediate_files(["C_new", "S_new", "b0_new", "c0_new", "g", "YrA"])
+
                     # ----- Second Spatial Update -----
                     logger.info("CNMF Iteration 2: Spatial update...")
                     param_second_spatial = params.get(
@@ -1492,7 +1507,11 @@ class Processing(dj.Computed):
                         b=b_new2, f=f_new2,
                         **param_second_temporal
                     )
-                    A_final = A_new2.sel(unit_id=mask_final)
+
+                    # <<< PATCHED: unit_merge coordinate fix (same pattern as iteration 1)
+                    # Sync A with C_final's actual coordinates
+                    A_final = A_new2.sel(unit_id=C_final.coords["unit_id"].values)
+                    # >>> END PATCH
                     logger.info(f"Final units: {A_final.sizes['unit_id']}")
 
                     # ===== SAVE FINAL RESULTS =====
