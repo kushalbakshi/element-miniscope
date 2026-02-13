@@ -1533,52 +1533,6 @@ class Processing(dj.Computed):
                     S_mrg = save_minian(S_mrg.rename("S_mrg"), minian_data_path, overwrite=True)
                     gc.collect()
                     logger.info("Saved merged results to zarr for iteration 2")
-                    # Scale down workers for memory-intensive CNMF spatial updates.
-                    # Preprocessing/motion correction can use 8 workers fine, but
-                    # update_spatial with 71k+ frames needs fewer workers with more
-                    # memory each to avoid OOM on intermediate QR/tensordot products.
-                    n_frames = varr.sizes["frame"]
-                    if n_frames > 5000 and n_workers > 2:
-                        logger.info(
-                            f"Large dataset ({n_frames} frames) — scaling to 2 workers "
-                            f"for CNMF iteration 2 to avoid memory pressure"
-                        )
-                        client.close()
-                        cluster.close()
-                        gc.collect()
-
-                        cnmf_n_workers = 2
-                        cnmf_mem_per_worker = f"{int(memory_total * 0.8 / cnmf_n_workers / (1024**3))}GB"
-                        cluster = LocalCluster(
-                            n_workers=cnmf_n_workers,
-                            memory_limit=cnmf_mem_per_worker,
-                            resources={"MEM": 1},
-                            threads_per_worker=2,
-                            dashboard_address=None,
-                        )
-                        annotation_plugin = TaskAnnotation()
-                        cluster.scheduler.add_plugin(annotation_plugin)
-                        client = Client(cluster)
-                        # Re-register the solve_triangular guard on new workers
-                        client.register_worker_plugin(SolveTriangularNaNGuard())
-                        logger.info(
-                            f"Restarted cluster: {cnmf_n_workers} workers × "
-                            f"{cnmf_mem_per_worker} each"
-                        )
-
-                        # Reload zarr-backed arrays for the new cluster
-                        Y_fm_chk = save_minian(
-                            xr.open_zarr(minian_data_path + "/Y_fm_chk.zarr")["Y_fm_chk"].rename("Y_fm_chk"),
-                            minian_data_path, overwrite=True,
-                        )
-                        Y_hw_chk = save_minian(
-                            xr.open_zarr(minian_data_path + "/Y_hw_chk.zarr")["Y_hw_chk"].rename("Y_hw_chk"),
-                            minian_data_path, overwrite=True,
-                        )
-                        sn_spatial = save_minian(
-                            xr.open_zarr(minian_data_path + "/sn_spatial.zarr")["sn_spatial"].rename("sn_spatial"),
-                            minian_data_path, overwrite=True,
-                        )
 
                     # ========================================
                     # CNMF ITERATION 2
