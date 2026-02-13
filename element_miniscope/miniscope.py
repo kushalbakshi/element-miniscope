@@ -971,8 +971,18 @@ class Processing(dj.Computed):
                 import multiprocessing
                 import psutil
                 import shutil
+                import dask
                 import dask.array as darr
+                import scipy.linalg                          # <<< NEW: for solve_triangular patch
+                import xarray as xr                          # <<< NEW: for sanitize_array
                 from dask.distributed import Client, LocalCluster
+
+                # <<< NEW: Prevent infinite retry loops on NaN/Inf errors >>>
+                # If a Dask task fails (e.g. solve_triangular ValueError), don't
+                # keep retrying until OOM — fail fast after 3 attempts.
+                dask.config.set({
+                    "distributed.scheduler.allowed-failures": 3,
+                })
 
                 # ===== APPLY COMPATIBILITY PATCHES =====
                 
@@ -1119,7 +1129,20 @@ class Processing(dj.Computed):
 
                 cnmf_module.update_temporal = patched_update_temporal
 
-                logger.info("Applied minian compatibility patches (NetworkX, sparse arrays, dask.block)")
+                # <<< NEW PATCH: scipy.linalg.solve_triangular NaN/Inf guard >>>
+                # Prevents ValueError('array must not contain infs or NaNs') from
+                # crashing Dask tasks and triggering infinite retry → OOM loops.
+                _original_scipy_solve_tri = scipy.linalg.solve_triangular
+
+                def patched_solve_triangular(a, b, **kwargs):
+                    """Sanitize NaN/Inf before calling solve_triangular."""
+                    a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+                    b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
+                    return _original_scipy_solve_tri(a, b, **kwargs)
+
+                scipy.linalg.solve_triangular = patched_solve_triangular
+
+                logger.info("Applied minian compatibility patches (NetworkX, sparse arrays, dask.block, solve_triangular NaN guard)")
 
                 # Now import minian modules (after patches are applied)
                 from minian.cnmf import (
@@ -1198,6 +1221,29 @@ class Processing(dj.Computed):
                         path = os.path.join(directory_path, f"{fname}.zarr")
                         if os.path.exists(path):
                             shutil.rmtree(path)
+
+                def sanitize_array(arr, name="array"):
+                    """Replace NaN/Inf in an xarray DataArray with 0.
+                    Works with both lazy (dask-backed) and in-memory arrays."""
+                    logger.info(f"Sanitizing {name} (replacing NaN/Inf with 0)...")
+                    if hasattr(arr.data, "dask"):
+                        sanitized = xr.apply_ufunc(
+                            lambda x: np.nan_to_num(
+                                x, nan=0.0, posinf=0.0, neginf=0.0
+                            ),
+                            arr,
+                            dask="parallelized",
+                            output_dtypes=[arr.dtype],
+                        )
+                    else:
+                        sanitized = xr.DataArray(
+                            np.nan_to_num(
+                                arr.values, nan=0.0, posinf=0.0, neginf=0.0
+                            ),
+                            coords=arr.coords,
+                            dims=arr.dims,
+                        )
+                    return sanitized
 
                 # Start Dask cluster
                 logger.info(
@@ -1280,6 +1326,14 @@ class Processing(dj.Computed):
 
                     logger.info("Applying motion correction...")
                     Y = apply_transform(varr_ref, motion, fill=0)
+
+                    # <<< NEW: Sanitize after motion correction >>>
+                    # apply_transform can introduce NaN at frame borders where the
+                    # shift goes beyond the image boundary. The fill=0 param should
+                    # handle this, but edge cases slip through on large datasets
+                    # with float64 precision. This prevents downstream
+                    # solve_triangular crashes in CNMF.
+                    Y = sanitize_array(Y, "Y_post_motion_correction")
 
                     # Save two versions with different chunking
                     logger.info("Saving motion-corrected video (frame-chunked)...")
@@ -1443,7 +1497,8 @@ class Processing(dj.Computed):
                         **param_first_temporal
                     )
                     logger.info(f"Units after first temporal update: {C_new.sizes['unit_id']}")
-
+                    C_new = sanitize_array(C_new, "C_new_pre_merge")
+                    S_new = sanitize_array(S_new, "S_new_pre_merge")
                     # ----- First Merge -----
                     logger.info("CNMF Iteration 1: Merging units...")
                     param_first_merge = params.get("param_first_merge", {"thres_corr": 0.8})
@@ -1501,6 +1556,8 @@ class Processing(dj.Computed):
                         b=b_new2, f=f_new2,
                         **param_second_temporal
                     )
+                    C_final = sanitize_array(C_final, "C_final_post_temporal_2")
+                    S_final = sanitize_array(S_final, "S_final_post_temporal_2")
 
                     # <<< PATCHED: unit_merge coordinate fix (same pattern as iteration 1)
                     # Sync A with C_final's actual coordinates
