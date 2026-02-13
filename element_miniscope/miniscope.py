@@ -1270,7 +1270,7 @@ class Processing(dj.Computed):
                 annotation_plugin = TaskAnnotation()
                 cluster.scheduler.add_plugin(annotation_plugin)
                 client = Client(cluster)
-                client.register_plugin(SolveTriangularNaNGuard())
+                client.register_worker_plugin(SolveTriangularNaNGuard())
 
                 try:
                     # ===== LOAD VIDEOS =====
@@ -1560,7 +1560,7 @@ class Processing(dj.Computed):
                         cluster.scheduler.add_plugin(annotation_plugin)
                         client = Client(cluster)
                         # Re-register the solve_triangular guard on new workers
-                        client.register_plugin(SolveTriangularNaNGuard())
+                        client.register_worker_plugin(SolveTriangularNaNGuard())
                         logger.info(
                             f"Restarted cluster: {cnmf_n_workers} workers × "
                             f"{cnmf_mem_per_worker} each"
