@@ -983,6 +983,10 @@ class Processing(dj.Computed):
                 # keep retrying until OOM — fail fast after 3 attempts.
                 dask.config.set({
                     "distributed.scheduler.allowed-failures": 3,
+                    "distributed.comm.timeouts.connect": "300s",
+                    "distributed.comm.timeouts.tcp": "7200s",      # 2 hours
+                    "distributed.worker.lifetime.stale": "7200s",   # don't mark workers stale quickly
+                    "distributed.scheduler.work-stealing": False,
                 })
 
                 # ===== APPLY COMPATIBILITY PATCHES =====
@@ -1349,7 +1353,7 @@ class Processing(dj.Computed):
                     # Save two versions with different chunking
                     logger.info("Saving motion-corrected video (frame-chunked)...")
                     Y_fm_chk = save_minian(
-                        Y.astype(float).rename("Y_fm_chk"),
+                        Y.astype(np.float32).rename("Y_fm_chk"),
                         minian_data_path,
                         overwrite=True,
                     )
