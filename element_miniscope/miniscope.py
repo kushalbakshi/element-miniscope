@@ -984,9 +984,9 @@ class Processing(dj.Computed):
                 dask.config.set({
                     "distributed.scheduler.allowed-failures": 3,
                     "distributed.comm.timeouts.connect": "300s",
-                    "distributed.comm.timeouts.tcp": "7200s",      # 2 hours
-                    "distributed.worker.lifetime.stale": "7200s",   # don't mark workers stale quickly
+                    "distributed.comm.timeouts.tcp": "7200s",
                     "distributed.scheduler.work-stealing": False,
+                    "distributed.scheduler.worker-ttl": "7200s",    # ← ADD THIS: 1 hour before declaring worker dead
                 })
 
                 # ===== APPLY COMPATIBILITY PATCHES =====
@@ -1366,9 +1366,9 @@ class Processing(dj.Computed):
                         chunks={"frame": -1, "height": chk["height"], "width": chk["width"]},
                     )
 
-                    # Save motion corrected video as mp4
-                    logger.info("Writing motion corrected video...")
-                    write_video(Y_fm_chk, "motion_corrected.mp4", str(output_dir))
+                    # # Save motion corrected video as mp4
+                    # logger.info("Writing motion corrected video...")
+                    # write_video(Y_fm_chk, "motion_corrected.mp4", str(output_dir))
 
                     # Create and save max projection
                     logger.info("Computing max projection...")
