@@ -969,776 +969,109 @@ class Processing(dj.Computed):
                 ]
 
             elif method == "minian":
-                extra_params = params.pop("extra_dj_params", {})
-                docker_image = extra_params.get("docker_image", None)
+                import docker as docker_sdk
+                import json as json_mod
 
-                if docker_image:
-                    # === DOCKER CONTAINER EXECUTION PATH ===
-                    # Runs the original minian (Python 3.8) in a sibling container
-                    import docker as docker_sdk
-                    import json as json_mod
+                docker_image = os.environ.get(
+                    "MINIAN_DOCKER_IMAGE", "datajoint/minian-py38:latest"
+                )
+                logger.info(f"Running minian via Docker container: {docker_image}")
 
-                    logger.info(
-                        f"Running minian via Docker container: {docker_image}"
+                # Resolve host-level paths for sibling container volume mounts
+                host_s3_root = os.environ["HOST_S3_ROOT"]
+                host_outbox = os.environ["HOST_OUTBOX"]
+                container_raw_root = os.environ.get(
+                    "RAW_ROOT_DATA_DIR", "/home/jovyan/s3/inbox"
+                )
+                container_processed_root = os.environ.get(
+                    "PROCESSED_ROOT_DATA_DIR", "/home/jovyan/efs/outbox"
+                )
+
+                # Map container paths -> host paths for sibling container mounts
+                input_dir = str(pathlib.Path(avi_files[0]).parent)
+                input_dir_host = input_dir.replace(
+                    container_raw_root, host_s3_root + "/inbox", 1
+                )
+                output_dir_host = str(output_dir).replace(
+                    container_processed_root, host_outbox, 1
+                )
+
+                # Write config JSON to shared filesystem
+                n_workers = int(os.getenv("MINIAN_NWORKERS", 2))
+                memory_limit_env = os.getenv("MINIAN_MEMORY_LIMIT", "4")
+                memory_limit = (
+                    memory_limit_env
+                    if any(c.isalpha() for c in memory_limit_env)
+                    else f"{memory_limit_env}GB"
+                )
+                container_mem_limit = os.getenv("MINIAN_CONTAINER_MEM_LIMIT", "24g")
+
+                config = {
+                    "input_dir": "/data/input",
+                    "output_dir": "/data/output",
+                    "intermediate_dir": "/data/output/minian_data",
+                    "params": params,
+                    "n_workers": n_workers,
+                    "memory_limit": memory_limit,
+                }
+                config_path = output_dir / "minian_config.json"
+                with open(config_path, "w") as f:
+                    json_mod.dump(config, f, indent=2, default=str)
+
+                # Spawn sibling container
+                docker_client = docker_sdk.from_env()
+                container_result = docker_client.containers.run(
+                    image=docker_image,
+                    command=[
+                        "python",
+                        "/opt/run_minian.py",
+                        "/data/output/minian_config.json",
+                    ],
+                    volumes={
+                        input_dir_host: {"bind": "/data/input", "mode": "ro"},
+                        output_dir_host: {"bind": "/data/output", "mode": "rw"},
+                    },
+                    mem_limit=container_mem_limit,
+                    environment={
+                        "MINIAN_NWORKERS": str(n_workers),
+                        "MINIAN_MEMORY_LIMIT": memory_limit_env,
+                        "MKL_NUM_THREADS": "1",
+                        "OPENBLAS_NUM_THREADS": "1",
+                        "OMP_NUM_THREADS": "1",
+                    },
+                    remove=True,
+                    detach=False,
+                    stdout=True,
+                    stderr=True,
+                )
+                logger.info(f"Container output:\n{container_result.decode()}")
+
+                # Verify completion marker
+                if (output_dir / ".minian_error").exists():
+                    with open(output_dir / ".minian_error") as f:
+                        err = json_mod.load(f)
+                    raise RuntimeError(
+                        f"Minian container error: {err.get('error')}"
+                    )
+                if not (output_dir / ".minian_complete").exists():
+                    raise RuntimeError(
+                        "Minian container exited without completion marker"
                     )
 
-                    # Resolve host-level paths for sibling container volume mounts
-                    host_s3_root = os.environ["HOST_S3_ROOT"]
-                    host_outbox = os.environ["HOST_OUTBOX"]
-                    container_raw_root = os.environ.get(
-                        "RAW_ROOT_DATA_DIR", "/home/jovyan/s3/inbox"
-                    )
-                    container_processed_root = os.environ.get(
-                        "PROCESSED_ROOT_DATA_DIR", "/home/jovyan/efs/outbox"
-                    )
+                # Load results
+                minian_loader = MinianLoader(str(output_dir))
+                key["processing_time"] = minian_loader.creation_time
+                key["package_version"] = "1.2.1-py38-docker"
 
-                    # Map container paths -> host paths for sibling container mounts
-                    input_dir = str(pathlib.Path(avi_files[0]).parent)
-                    input_dir_host = input_dir.replace(
-                        container_raw_root, host_s3_root + "/inbox", 1
-                    )
-                    output_dir_host = str(output_dir).replace(
-                        container_processed_root, host_outbox, 1
-                    )
-
-                    # Write config JSON to shared filesystem
-                    n_workers = int(os.getenv("MINIAN_NWORKERS", 2))
-                    memory_limit_env = os.getenv("MINIAN_MEMORY_LIMIT", "4")
-                    memory_limit = (
-                        memory_limit_env
-                        if any(c.isalpha() for c in memory_limit_env)
-                        else f"{memory_limit_env}GB"
-                    )
-                    config = {
-                        "input_dir": "/data/input",
-                        "output_dir": "/data/output",
-                        "intermediate_dir": "/data/output/minian_data",
-                        "params": params,
-                        "n_workers": n_workers,
-                        "memory_limit": memory_limit,
+                file_entries = [
+                    {
+                        **key,
+                        "file_name": f.name,
+                        "file": f.as_posix(),
                     }
-                    config_path = output_dir / "minian_config.json"
-                    with open(config_path, "w") as f:
-                        json_mod.dump(config, f, indent=2, default=str)
-
-                    # Spawn sibling container
-                    client = docker_sdk.from_env()
-                    container_result = client.containers.run(
-                        image=docker_image,
-                        command=[
-                            "python",
-                            "/opt/run_minian.py",
-                            "/data/output/minian_config.json",
-                        ],
-                        volumes={
-                            input_dir_host: {"bind": "/data/input", "mode": "ro"},
-                            output_dir_host: {"bind": "/data/output", "mode": "rw"},
-                        },
-                        mem_limit=extra_params.get("container_mem_limit", "24g"),
-                        environment={
-                            "MINIAN_NWORKERS": str(n_workers),
-                            "MINIAN_MEMORY_LIMIT": memory_limit_env,
-                            "MKL_NUM_THREADS": "1",
-                            "OPENBLAS_NUM_THREADS": "1",
-                            "OMP_NUM_THREADS": "1",
-                        },
-                        remove=True,
-                        detach=False,
-                        stdout=True,
-                        stderr=True,
-                    )
-                    logger.info(
-                        f"Container output:\n{container_result.decode()}"
-                    )
-
-                    # Verify completion marker
-                    if (output_dir / ".minian_error").exists():
-                        with open(output_dir / ".minian_error") as f:
-                            err = json_mod.load(f)
-                        raise RuntimeError(
-                            f"Minian container error: {err.get('error')}"
-                        )
-                    if not (output_dir / ".minian_complete").exists():
-                        raise RuntimeError(
-                            "Minian container exited without completion marker"
-                        )
-
-                    # Load results (reuses existing MinianLoader)
-                    minian_loader = MinianLoader(str(output_dir))
-                    key["processing_time"] = minian_loader.creation_time
-                    key["package_version"] = "1.2.1-py38-docker"
-
-                    file_entries = [
-                        {
-                            **key,
-                            "file_name": f.name,
-                            "file": f.as_posix(),
-                        }
-                        for f in output_dir.rglob("*")
-                        if f.is_file()
-                    ]
-
-                else:
-                    # === EXISTING INLINE EXECUTION PATH ===
-                    import multiprocessing
-                    import psutil
-                    import shutil
-                    import dask
-                    import dask.array as darr
-                    import scipy.linalg                          # <<< NEW: for solve_triangular patch
-                    import xarray as xr                          # <<< NEW: for sanitize_array
-                    from dask.distributed import Client, LocalCluster
-    
-                    # <<< NEW: Prevent infinite retry loops on NaN/Inf errors >>>
-                    # If a Dask task fails (e.g. solve_triangular ValueError), don't
-                    # keep retrying until OOM — fail fast after 3 attempts.
-                    dask.config.set({
-                        "distributed.scheduler.allowed-failures": 3,
-                        "distributed.comm.timeouts.connect": "300s",
-                        "distributed.comm.timeouts.tcp": "7200s",
-                        "distributed.scheduler.work-stealing": False,
-                        "distributed.scheduler.worker-ttl": "7200s",    # ← ADD THIS: 1 hour before declaring worker dead
-                    })
-    
-                    # ===== APPLY COMPATIBILITY PATCHES =====
-                    
-                    # Fix for NetworkX 3.0+ API changes
-                    import networkx as nx
-                    import scipy.sparse
-                    from scipy.sparse import issparse
-                    import minian.cnmf as cnmf_module
-    
-                    def label_connected_fixed(adj, only_connected=False):
-                        """Fixed label_connected for NetworkX 3.0+ compatibility."""
-                        if issparse(adj):
-                            adj = adj.toarray()
-                        adj = adj.copy()
-                        np.fill_diagonal(adj, 0)
-                        adj = np.triu(adj)
-                        g = nx.from_numpy_array(adj)
-                        labels = np.zeros(adj.shape[0], dtype=int)
-                        for icomp, comp in enumerate(nx.connected_components(g)):
-                            for node in comp:
-                                labels[node] = icomp
-                        if only_connected:
-                            iso_mask = np.array([len(c) == 1 for c in nx.connected_components(g)])
-                            labels[np.isin(labels, np.where(iso_mask)[0])] = -1
-                        return labels
-    
-                    cnmf_module.label_connected = label_connected_fixed
-    
-                    # Fix for sparse array auto-densification
-                    import sparse
-                    import sparse.numba_backend._sparse_array as sparse_mod
-                    sparse_mod.AUTO_DENSIFY = True
-    
-                    # Fix for darr.block with mixed sparse array types
-                    _original_darr_block = darr.block
-    
-                    def patched_darr_block(arrays, allow_unknown_chunksizes=False):
-                        """Patched darr.block that ensures sparse array type consistency."""
-                        def convert_to_coo(arr):
-                            if arr is None:
-                                return arr
-                            if isinstance(arr, sparse.COO):
-                                return arr
-                            if isinstance(arr, sparse.SparseArray):
-                                return sparse.COO(arr)
-                            if isinstance(arr, np.ndarray):
-                                return sparse.COO.from_numpy(arr)
-                            if hasattr(arr, 'todense'):
-                                return sparse.COO.from_numpy(np.asarray(arr.todense()))
-                            return arr
-    
-                        def recursive_convert(obj):
-                            if isinstance(obj, list):
-                                return [recursive_convert(item) for item in obj]
-                            elif isinstance(obj, np.ndarray) and obj.dtype == object:
-                                result = np.empty_like(obj)
-                                for idx in np.ndindex(obj.shape):
-                                    result[idx] = convert_to_coo(obj[idx])
-                                return result
-                            else:
-                                return convert_to_coo(obj)
-    
-                        try:
-                            return _original_darr_block(arrays, allow_unknown_chunksizes=allow_unknown_chunksizes)
-                        except ValueError as e:
-                            if "All arrays must be instances of SparseArray" in str(e):
-                                converted = recursive_convert(arrays)
-                                return _original_darr_block(converted, allow_unknown_chunksizes=allow_unknown_chunksizes)
-                            raise
-    
-                    darr.block = patched_darr_block
-                    darr.core.block = patched_darr_block
-    
-                    # ===== PATCH: sparse/dense concatenation compatibility =====
-                    import sparse
-                    import sparse.numba_backend._coo.common as _sparse_coo_common
-                    import numpy as np
-    
-                    _original_sparse_concat = _sparse_coo_common.concatenate
-    
-                    def _patched_sparse_concat(arrays, axis=0):
-                        """Convert any dense arrays to sparse.COO before concatenation."""
-                        converted = []
-                        for arr in arrays:
-                            if isinstance(arr, sparse.SparseArray):
-                                converted.append(arr)
-                            elif isinstance(arr, np.ndarray):
-                                converted.append(sparse.COO.from_numpy(arr))
-                            else:
-                                try:
-                                    converted.append(sparse.COO.from_numpy(np.asarray(arr)))
-                                except Exception:
-                                    converted.append(arr)
-                        return _original_sparse_concat(converted, axis=axis)
-    
-                    _sparse_coo_common.concatenate = _patched_sparse_concat
-    
-                    # ===== PATCH: sparse/dense concatenation compatibility =====
-                    import sparse
-                    import numpy as np
-                    import sparse.numba_backend._coo.common as _sparse_coo_common
-    
-                    _original_check = _sparse_coo_common.check_consistent_fill_value
-    
-                    def _patched_check(arrays):
-                        """Auto-convert any dense arrays to sparse.COO before validation."""
-                        for i, arr in enumerate(arrays):
-                            if not isinstance(arr, sparse.SparseArray):
-                                arrays[i] = sparse.COO.from_numpy(np.asarray(arr))
-                        return _original_check(arrays)
-    
-                    _sparse_coo_common.check_consistent_fill_value = _patched_check
-                    # Patch update_temporal to handle sparse.COO arrays
-                    _original_update_temporal = cnmf_module.update_temporal
-    
-                    def patched_update_temporal(A, C, b=None, f=None, Y=None, YrA=None, 
-                                                noise_freq=0.25, p=2, add_lag="p", jac_thres=0.1, 
-                                                sparse_penal=1, bseg=None, med_wd=None, 
-                                                zero_thres=1e-8, max_iters=200, use_smooth=True, 
-                                                normalize=True, warm_start=False, post_scal=False, 
-                                                scs_fallback=False, concurrent_update=False):
-                        """Patched update_temporal that handles sparse.COO arrays properly."""
-                        _original_csc_matrix = scipy.sparse.csc_matrix
-    
-                        class PatchedCSCMatrix(scipy.sparse.csc_matrix):
-                            def __new__(cls, arg1, shape=None, dtype=None, copy=False):
-                                if hasattr(arg1, 'todense'):
-                                    arg1 = arg1.todense()
-                                return _original_csc_matrix(arg1, shape=shape, dtype=dtype, copy=copy)
-    
-                        scipy.sparse.csc_matrix = PatchedCSCMatrix
-                        try:
-                            result = _original_update_temporal(
-                                A, C, b=b, f=f, Y=Y, YrA=YrA, noise_freq=noise_freq,
-                                p=p, add_lag=add_lag, jac_thres=jac_thres, sparse_penal=sparse_penal,
-                                bseg=bseg, med_wd=med_wd, zero_thres=zero_thres, max_iters=max_iters,
-                                use_smooth=use_smooth, normalize=normalize, warm_start=warm_start,
-                                post_scal=post_scal, scs_fallback=scs_fallback, 
-                                concurrent_update=concurrent_update
-                            )
-                        finally:
-                            scipy.sparse.csc_matrix = _original_csc_matrix
-                        return result
-    
-                    cnmf_module.update_temporal = patched_update_temporal
-    
-                    # <<< NEW PATCH: scipy.linalg.solve_triangular NaN/Inf guard >>>
-                    # Prevents ValueError('array must not contain infs or NaNs') from
-                    # crashing Dask tasks and triggering infinite retry → OOM loops.
-                    from distributed import WorkerPlugin
-    
-                    class SolveTriangularNaNGuard(WorkerPlugin):
-                        """Patch scipy.linalg.solve_triangular on each Dask worker process
-                        to sanitize NaN/Inf inputs instead of crashing."""
-                        
-                        def setup(self, worker):
-                            import scipy.linalg
-                            import numpy as np
-                            
-                            _original = scipy.linalg.solve_triangular
-                            
-                            def patched_solve_triangular(a, b, **kwargs):
-                                a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
-                                b = np.nan_to_num(b, nan=0.0, posinf=0.0, neginf=0.0)
-                                return _original(a, b, **kwargs)
-                            
-                            scipy.linalg.solve_triangular = patched_solve_triangular
-    
-                    logger.info("Applied minian compatibility patches (NetworkX, sparse arrays, dask.block, solve_triangular NaN guard)")
-    
-                    # Now import minian modules (after patches are applied)
-                    from minian.cnmf import (
-                        get_noise_fft,
-                        unit_merge,
-                        update_spatial,
-                        update_temporal,
-                        update_background,
-                    )
-                    from minian.initialization import (
-                        initA,
-                        initC,
-                        ks_refine,
-                        pnr_refine,
-                        seeds_init,
-                        seeds_merge,
-                    )
-                    from minian.motion_correction import apply_transform, estimate_motion
-                    from minian.preprocessing import denoise, remove_background
-                    from minian.utilities import (
-                        TaskAnnotation,
-                        get_optimal_chk,
-                        load_videos,
-                        save_minian,
-                    )
-                    from minian.visualization import write_video
-    
-                    # ===== CONTAINER-AWARE MEMORY DETECTION =====
-                    def get_container_memory_limit():
-                        """Get memory limit respecting container cgroups (v1 and v2)."""
-                        try:
-                            with open("/sys/fs/cgroup/memory.max") as f:
-                                limit = f.read().strip()
-                                if limit != "max":
-                                    return int(limit)
-                        except (FileNotFoundError, PermissionError):
-                            pass
-                        try:
-                            with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as f:
-                                limit = int(f.read().strip())
-                                if limit < 9223372036854771712:
-                                    return limit
-                        except (FileNotFoundError, PermissionError):
-                            pass
-                        return psutil.virtual_memory().total
-    
-                    # ===== DASK CLUSTER CONFIGURATION =====
-                    memory_total = get_container_memory_limit()
-                    n_workers = int(
-                        os.getenv(
-                            "MINIAN_NWORKERS",
-                            max(1, min(int(multiprocessing.cpu_count() * 0.4), 8)),
-                        )
-                    )
-                    memory_per_worker = int(memory_total * 0.8 / n_workers)
-    
-                    memory_limit_env = os.getenv("MINIAN_MEMORY_LIMIT")
-                    if memory_limit_env:
-                        memory_limit = (
-                            memory_limit_env
-                            if any(c.isalpha() for c in memory_limit_env)
-                            else f"{memory_limit_env}GB"
-                        )
-                    else:
-                        memory_limit = f"{memory_per_worker // (1024**3)}GB"
-    
-                    # Set minian intermediate storage paths
-                    minian_data_path = str(output_dir / "minian_data")
-                    os.makedirs(minian_data_path, exist_ok=True)
-                    os.environ["MINIAN_INTERMEDIATE"] = minian_data_path
-    
-                    # Helper function to clean intermediate files
-                    def clean_intermediate_files(directory_path, file_names):
-                        """Remove intermediate zarr files to avoid conflicts."""
-                        for fname in file_names:
-                            path = os.path.join(directory_path, f"{fname}.zarr")
-                            if os.path.exists(path):
-                                shutil.rmtree(path)
-    
-                    def sanitize_array(arr, name="array"):
-                        """Replace NaN/Inf in an xarray DataArray with 0.
-                        Works with both lazy (dask-backed) and in-memory arrays."""
-                        logger.info(f"Sanitizing {name} (replacing NaN/Inf with 0)...")
-                        if hasattr(arr.data, "dask"):
-                            sanitized = xr.apply_ufunc(
-                                lambda x: np.nan_to_num(
-                                    x, nan=0.0, posinf=0.0, neginf=0.0
-                                ),
-                                arr,
-                                dask="parallelized",
-                                output_dtypes=[arr.dtype],
-                            )
-                        else:
-                            sanitized = xr.DataArray(
-                                np.nan_to_num(
-                                    arr.values, nan=0.0, posinf=0.0, neginf=0.0
-                                ),
-                                coords=arr.coords,
-                                dims=arr.dims,
-                            )
-                        return sanitized
-    
-                    # Start Dask cluster
-                    logger.info(
-                        f"Starting Minian processing with {n_workers} workers, "
-                        f"{memory_limit} memory limit per worker..."
-                    )
-                    cluster = LocalCluster(
-                        n_workers=n_workers,
-                        memory_limit=memory_limit,
-                        resources={"MEM": 1},
-                        threads_per_worker=2,
-                        dashboard_address=None,
-                    )
-                    annotation_plugin = TaskAnnotation()
-                    cluster.scheduler.add_plugin(annotation_plugin)
-                    client = Client(cluster)
-                    client.register_worker_plugin(SolveTriangularNaNGuard())
-    
-                    try:
-                        # ===== LOAD VIDEOS =====
-                        logger.info("Loading videos...")
-                        default_load_params = {
-                            "pattern": r".*\.avi$",
-                            "dtype": np.uint8,
-                            "downsample": dict(frame=1, height=1, width=1),
-                            "downsample_strategy": "subset",
-                        }
-                        param_load_videos = {
-                            **default_load_params,
-                            **params.get("param_load_videos", {}),
-                        }
-                        varr = load_videos(
-                            str(pathlib.Path(avi_files[0]).parent), **param_load_videos
-                        )
-                        chk, _ = get_optimal_chk(varr, dtype=float)
-    
-                        # Save raw video to zarr
-                        logger.info("Saving raw video to zarr...")
-                        varr = save_minian(
-                            varr.chunk({"frame": chk["frame"], "height": -1, "width": -1}).rename("varr"),
-                            minian_data_path,
-                            overwrite=True,
-                        )
-                        logger.info(
-                            f"Loaded video: {varr.sizes['frame']} frames, "
-                            f"{varr.sizes['height']}x{varr.sizes['width']} pixels"
-                        )
-    
-                        # ===== PREPROCESSING =====
-                        logger.info("Preprocessing: glow removal...")
-                        varr_min = varr.min("frame").compute()
-                        varr_ref = varr - varr_min
-                        varr_ref = varr_ref.clip(min=0)
-    
-                        logger.info("Preprocessing: denoising...")
-                        param_denoise = params.get(
-                            "param_denoise", {"method": "median", "ksize": 7}
-                        )
-                        varr_ref = denoise(varr_ref, **param_denoise)
-    
-                        logger.info("Preprocessing: background removal...")
-                        param_background_removal = params.get(
-                            "param_background_removal", {"method": "tophat", "wnd": 10}
-                        )
-                        varr_ref = remove_background(varr_ref, **param_background_removal)
-    
-                        # Keep it chunked
-                        varr_ref = varr_ref.chunk({"frame": chk["frame"], "height": -1, "width": -1})
-    
-                        # ===== MOTION CORRECTION =====
-                        logger.info("Estimating motion...")
-                        param_estimate_motion = params.get(
-                            "param_estimate_motion", {"dim": "frame"}
-                        )
-                        motion = estimate_motion(varr_ref, **param_estimate_motion)
-                        motion = save_minian(
-                            motion.rename("motion").chunk({"frame": chk["frame"]}),
-                            minian_data_path,
-                            overwrite=True,
-                        )
-    
-                        logger.info("Applying motion correction...")
-                        Y = apply_transform(varr_ref, motion, fill=0)
-    
-                        # <<< NEW: Sanitize after motion correction >>>
-                        # apply_transform can introduce NaN at frame borders where the
-                        # shift goes beyond the image boundary. The fill=0 param should
-                        # handle this, but edge cases slip through on large datasets
-                        # with float64 precision. This prevents downstream
-                        # solve_triangular crashes in CNMF.
-                        Y = sanitize_array(Y, "Y_post_motion_correction")
-    
-                        # Save two versions with different chunking
-                        logger.info("Saving motion-corrected video (frame-chunked)...")
-                        Y_fm_chk = save_minian(
-                            Y.astype(np.float32).rename("Y_fm_chk"),
-                            minian_data_path,
-                            overwrite=True,
-                        )
-    
-                        logger.info("Saving motion-corrected video (spatial-chunked)...")
-                        Y_hw_chk = save_minian(
-                            Y_fm_chk.rename("Y_hw_chk"),
-                            minian_data_path,
-                            overwrite=True,
-                            chunks={"frame": -1, "height": chk["height"], "width": chk["width"]},
-                        )
-    
-                        # # Save motion corrected video as mp4
-                        # logger.info("Writing motion corrected video...")
-                        # write_video(Y_fm_chk, "motion_corrected.mp4", str(output_dir))
-    
-                        # Create and save max projection
-                        logger.info("Computing max projection...")
-                        max_proj = Y_fm_chk.max("frame").compute()
-                        max_proj = save_minian(max_proj.rename("max_proj"), minian_data_path, overwrite=True)
-    
-                        # ===== SEED INITIALIZATION =====
-                        logger.info("Initializing seeds...")
-                        param_seeds_init = params.get(
-                            "param_seeds_init",
-                            {
-                                "wnd_size": 1000,
-                                "method": "rolling",
-                                "stp_size": 500,
-                                "max_wnd": 15,
-                                "diff_thres": 3,
-                            },
-                        )
-                        seeds = seeds_init(Y_fm_chk, **param_seeds_init)
-                        logger.info(f"Initial seeds: {len(seeds)}")
-    
-                        logger.info("Refining seeds with PNR...")
-                        param_pnr_refine = params.get(
-                            "param_pnr_refine", {"noise_freq": 0.06, "thres": 1}
-                        )
-                        seeds, pnr, gmm = pnr_refine(Y_hw_chk, seeds, **param_pnr_refine)
-                        logger.info(f"Seeds after PNR refine: {seeds['mask_pnr'].sum()} / {len(seeds)}")
-    
-                        logger.info("Refining seeds with KS test...")
-                        param_ks_refine = params.get("param_ks_refine", {"sig": 0.05})
-                        seeds = ks_refine(Y_hw_chk, seeds, **param_ks_refine)
-                        logger.info(f"Seeds after KS refine: {seeds['mask_ks'].sum()} / {len(seeds)}")
-    
-                        logger.info("Merging seeds...")
-                        param_seeds_merge = params.get(
-                            "param_seeds_merge",
-                            {"thres_dist": 10, "thres_corr": 0.8, "noise_freq": 0.06},
-                        )
-                        seeds_final = seeds[seeds["mask_ks"] & seeds["mask_pnr"]].reset_index(drop=True)
-                        seeds_final = seeds_merge(Y_hw_chk, max_proj, seeds_final, **param_seeds_merge)
-                        n_seeds = seeds_final["mask_mrg"].sum()
-                        logger.info(f"Seeds after merge: {n_seeds} / {len(seeds_final)}")
-    
-                        if n_seeds == 0:
-                            raise ValueError(
-                                "No seeds remaining after refinement. "
-                                "Consider adjusting param_seeds_init or param_pnr_refine thresholds."
-                            )
-    
-                        # ===== INITIALIZE A AND C =====
-                        logger.info("Initializing spatial footprints (A)...")
-                        param_initialize = params.get(
-                            "param_initialize", {"thres_corr": 0.8, "wnd": 10, "noise_freq": 0.06}
-                        )
-                        A_init = initA(Y_hw_chk, seeds_final[seeds_final["mask_mrg"]], **param_initialize)
-                        A_init = save_minian(A_init.rename("A_init"), minian_data_path, overwrite=True)
-                        logger.info(f"A_init shape: {A_init.shape}")
-    
-                        logger.info("Initializing temporal traces (C)...")
-                        C_init = initC(Y_fm_chk, A_init)
-                        C_init = save_minian(
-                            C_init.rename("C_init"),
-                            minian_data_path,
-                            overwrite=True,
-                            chunks={"unit_id": 1, "frame": -1},
-                        )
-                        logger.info(f"C_init shape: {C_init.shape}")
-    
-                        # Initial unit merge
-                        logger.info("Initial unit merge...")
-                        param_init_merge = params.get("param_init_merge", {"thres_corr": 0.8})
-                        A, C = unit_merge(A_init, C_init, **param_init_merge)
-                        A = save_minian(A.rename("A"), minian_data_path, overwrite=True)
-                        C = save_minian(C.rename("C"), minian_data_path, overwrite=True)
-                        C_chk = save_minian(
-                            C.rename("C_chk"),
-                            minian_data_path,
-                            overwrite=True,
-                            chunks={"unit_id": -1, "frame": chk["frame"]},
-                        )
-                        logger.info(f"Units after initial merge: {A.sizes['unit_id']}")
-    
-                        # ===== INITIALIZE BACKGROUND =====
-                        logger.info("Initializing background terms...")
-                        b, f = update_background(Y_fm_chk, A, C_chk)
-                        f = save_minian(f.rename("f"), minian_data_path, overwrite=True)
-                        b = save_minian(b.rename("b"), minian_data_path, overwrite=True)
-                        logger.info(f"Background initialized - b: {b.shape}, f: {f.shape}")
-    
-                        # ===== COMPUTE NOISE STATISTICS =====
-                        logger.info("Computing noise statistics...")
-                        param_get_noise = params.get("param_get_noise", {"noise_range": (0.06, 0.5)})
-                        sn_spatial = get_noise_fft(Y_hw_chk, **param_get_noise)
-                        sn_spatial = save_minian(sn_spatial.rename("sn_spatial"), minian_data_path, overwrite=True)
-    
-                        # ========================================
-                        # CNMF ITERATION 1
-                        # ========================================
-    
-                        # ----- First Spatial Update -----
-                        logger.info("CNMF Iteration 1: Spatial update...")
-                        param_first_spatial = params.get(
-                            "param_first_spatial",
-                            {"dl_wnd": 10, "sparse_penal": 0.01, "size_thres": (25, None)},
-                        )
-                        A_new, mask, norm_fac = update_spatial(
-                            Y_hw_chk, A, C, sn_spatial, **param_first_spatial
-                        )
-                        C_new = save_minian(
-                            (C.sel(unit_id=mask) * norm_fac).rename("C_new"),
-                            minian_data_path,
-                            overwrite=True,
-                        )
-                        C_chk_new = save_minian(
-                            (C_chk.sel(unit_id=mask) * norm_fac).rename("C_chk_new"),
-                            minian_data_path,
-                            overwrite=True,
-                        )
-                        logger.info(f"Units after first spatial update: {A_new.sizes['unit_id']}")
-    
-                        # Update background after first spatial
-                        logger.info("Updating background...")
-                        b_new, f_new = update_background(Y_fm_chk, A_new, C_chk_new)
-    
-                        # ----- First Temporal Update -----
-                        logger.info("CNMF Iteration 1: Temporal update...")
-                        param_first_temporal = params.get(
-                            "param_first_temporal",
-                            {
-                                "noise_freq": 0.06,
-                                "sparse_penal": 1,
-                                "p": 1,
-                                "add_lag": 20,
-                                "jac_thres": 0.2,
-                            },
-                        )
-                        C_new, S_new, b0_new, c0_new, g, mask = update_temporal(
-                            A_new, C_new,
-                            Y=Y_fm_chk,
-                            b=b_new, f=f_new,
-                            **param_first_temporal
-                        )
-                        logger.info(f"Units after first temporal update: {C_new.sizes['unit_id']}")
-                        C_new = sanitize_array(C_new, "C_new_pre_merge")
-                        S_new = sanitize_array(S_new, "S_new_pre_merge")
-                        # ----- First Merge -----
-                        logger.info("CNMF Iteration 1: Merging units...")
-                        param_first_merge = params.get("param_first_merge", {"thres_corr": 0.8})
-    
-                        # <<< PATCHED: unit_merge coordinate fix
-                        # update_temporal returns C_new/S_new already filtered by mask internally.
-                        # Sync A with C_new's actual coordinates instead of using the boolean mask,
-                        # which can cause alignment mismatches on large datasets.
-                        A_filtered = A_new.sel(unit_id=C_new.coords["unit_id"].values)
-                        logger.info(
-                            f"Unit sync check — A: {A_filtered.sizes['unit_id']}, "
-                            f"C: {C_new.sizes['unit_id']}, S: {S_new.sizes['unit_id']}"
-                        )
-                        A_mrg, C_mrg, [S_mrg] = unit_merge(
-                            A_filtered, C_new, [S_new], **param_first_merge
-                        )
-                        # >>> END PATCH
-                        logger.info(f"Units after first merge: {A_mrg.sizes['unit_id']}")
-                        A_mrg = save_minian(A_mrg.rename("A_mrg"), minian_data_path, overwrite=True)
-                        C_mrg = save_minian(C_mrg.rename("C_mrg"), minian_data_path, overwrite=True)
-                        S_mrg = save_minian(S_mrg.rename("S_mrg"), minian_data_path, overwrite=True)
-                        gc.collect()
-                        logger.info("Saved merged results to zarr for iteration 2")
-    
-                        # ========================================
-                        # CNMF ITERATION 2
-                        # ========================================
-    
-                        # ----- Second Spatial Update -----
-                        logger.info("CNMF Iteration 2: Spatial update...")
-                        param_second_spatial = params.get(
-                            "param_second_spatial",
-                            {"dl_wnd": 10, "sparse_penal": 0.01, "size_thres": (25, None)},
-                        )
-                        A_new2, mask2, norm_fac2 = update_spatial(
-                            Y_hw_chk, A_mrg, C_mrg, sn_spatial, **param_second_spatial
-                        )
-                        C_new2 = C_mrg.sel(unit_id=mask2) * norm_fac2
-                        logger.info(f"Units after second spatial update: {A_new2.sizes['unit_id']}")
-    
-                        # Update background after second spatial
-                        logger.info("Updating background...")
-                        b_new2, f_new2 = update_background(Y_fm_chk, A_new2, C_new2)
-    
-                        # ----- Second Temporal Update -----
-                        logger.info("CNMF Iteration 2: Temporal update...")
-                        param_second_temporal = params.get(
-                            "param_second_temporal",
-                            {
-                                "noise_freq": 0.06,
-                                "sparse_penal": 1,
-                                "p": 1,
-                                "add_lag": 20,
-                                "jac_thres": 0.4,
-                            },
-                        )
-                        C_final, S_final, b0_final, c0_final, g_final, mask_final = update_temporal(
-                            A_new2, C_new2,
-                            Y=Y_fm_chk,
-                            b=b_new2, f=f_new2,
-                            **param_second_temporal
-                        )
-                        C_final = sanitize_array(C_final, "C_final_post_temporal_2")
-                        S_final = sanitize_array(S_final, "S_final_post_temporal_2")
-    
-                        # <<< PATCHED: unit_merge coordinate fix (same pattern as iteration 1)
-                        # Sync A with C_final's actual coordinates
-                        A_final = A_new2.sel(unit_id=C_final.coords["unit_id"].values)
-                        # >>> END PATCH
-                        logger.info(f"Final units: {A_final.sizes['unit_id']}")
-    
-                        # ===== SAVE FINAL RESULTS =====
-                        logger.info("Saving final results to output directory...")
-                        final_save_params = {"dpath": str(output_dir), "overwrite": True}
-    
-                        A_final = save_minian(A_final.rename("A"), **final_save_params)
-                        C_final = save_minian(C_final.rename("C"), **final_save_params)
-                        S_final = save_minian(S_final.rename("S"), **final_save_params)
-                        b_final = save_minian(b_new2.rename("b"), **final_save_params)
-                        f_final = save_minian(f_new2.rename("f"), **final_save_params)
-                        motion_final = save_minian(motion.rename("motion"), **final_save_params)
-                        max_proj_final = save_minian(max_proj.rename("max_proj"), **final_save_params)
-    
-                        logger.info(
-                            f"Minian processing complete. {A_final.sizes['unit_id']} units detected."
-                        )
-    
-                    except Exception as e:
-                        logger.error(f"Minian processing failed: {e}")
-                        raise e
-                    finally:
-                        client.close()
-                        cluster.close()
-    
-                    # Load results and prepare for insertion
-                    minian_loader = MinianLoader(minian_data_path)
-                    key["processing_time"] = minian_loader.creation_time
-    
-                    # Get minian version if available
-                    try:
-                        import minian
-                        key["package_version"] = getattr(minian, "__version__", "")
-                    except (ImportError, AttributeError):
-                        key["package_version"] = ""
-    
-                    file_entries = [
-                        {
-                            **key,
-                            "file_name": f.name,
-                            "file": f.as_posix(),
-                        }
-                        for f in output_dir.rglob("*")
-                        if f.is_file()
-                    ]
+                    for f in output_dir.rglob("*")
+                    if f.is_file()
+                ]
 
         else:
             raise ValueError(f"Unknown task mode: {task_mode}")
