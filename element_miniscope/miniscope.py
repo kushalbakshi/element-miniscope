@@ -76,6 +76,17 @@ def activate(
         add_objects=_linking_module.__dict__,
     )
 
+# ─── Configuration ────────────────────────────────────────────────────────
+
+# Docker image for minian processing.
+# Override with env var MINIAN_DOCKER_IMAGE if using a custom registry.
+MINIAN_DOCKER_IMAGE = os.getenv(
+    "MINIAN_DOCKER_IMAGE", "datajoint/minian-base:0.1.0"
+)
+
+# Timeout for the docker run command (seconds). Default: 24 hours.
+# Large datasets (70k+ frames) can take many hours.
+MINIAN_DOCKER_TIMEOUT = int(os.getenv("MINIAN_DOCKER_TIMEOUT", "86400"))
 
 # Functions required by the element-miniscope  -----------------------------------------
 
@@ -781,6 +792,17 @@ class Processing(dj.Computed):
                 raise NotImplementedError(
                     f"Loading of {method} data is not yet supported"
                 )
+            file_entries = [
+                {
+                    **key,
+                    "file_name": f.relative_to(
+                        get_processed_root_data_dir()
+                    ).as_posix(),
+                    "file": f.as_posix(),
+                }
+                for f in output_dir.rglob("*")
+                if f.is_file()
+            ]
         elif task_mode == "trigger":
             avi_files = [
                 find_full_path(get_miniscope_root_data_dir(), avi_file).as_posix()
@@ -967,102 +989,25 @@ class Processing(dj.Computed):
                     for f in output_dir.rglob("*")
                     if f.is_file()
                 ]
-
             elif method == "minian":
-                import docker as docker_sdk
-                import json as json_mod
+                logger.info("Running minian via Docker container...")
 
-                docker_image = os.environ.get(
-                    "MINIAN_DOCKER_IMAGE", "datajoint/minian-py38:latest"
-                )
-                logger.info(f"Running minian via Docker container: {docker_image}")
-
-                # Resolve host-level paths for sibling container volume mounts
-                host_s3_root = os.environ["HOST_S3_ROOT"]
-                host_outbox = os.environ["HOST_OUTBOX"]
-                container_raw_root = os.environ.get(
-                    "RAW_ROOT_DATA_DIR", "/home/jovyan/s3/inbox"
-                )
-                container_processed_root = os.environ.get(
-                    "PROCESSED_ROOT_DATA_DIR", "/home/jovyan/efs/outbox"
+                # Run the minian pipeline in a Docker container
+                status = _run_minian_in_container(
+                    avi_files=avi_files,
+                    output_dir=output_dir,
+                    params=params,
                 )
 
-                # Map container paths -> host paths for sibling container mounts
-                input_dir = str(pathlib.Path(avi_files[0]).parent)
-                input_dir_host = input_dir.replace(
-                    container_raw_root, host_s3_root + "/inbox", 1
-                )
-                output_dir_host = str(output_dir).replace(
-                    container_processed_root, host_outbox, 1
+                # Set processing time from container output
+                key["processing_time"] = status.get(
+                    "timestamp", time.strftime("%Y-%m-%dT%H:%M:%S")
                 )
 
-                # Write config JSON to shared filesystem
-                n_workers = int(os.getenv("MINIAN_NWORKERS", 2))
-                memory_limit_env = os.getenv("MINIAN_MEMORY_LIMIT", "4")
-                memory_limit = (
-                    memory_limit_env
-                    if any(c.isalpha() for c in memory_limit_env)
-                    else f"{memory_limit_env}GB"
-                )
-                container_mem_limit = os.getenv("MINIAN_CONTAINER_MEM_LIMIT", "24g")
+                # Get minian version (from status.json or default)
+                key["package_version"] = status.get("minian_version", "")
 
-                config = {
-                    "input_dir": "/data/input",
-                    "output_dir": "/data/output",
-                    "intermediate_dir": "/data/output/minian_data",
-                    "params": params,
-                    "n_workers": n_workers,
-                    "memory_limit": memory_limit,
-                }
-                config_path = output_dir / "minian_config.json"
-                with open(config_path, "w") as f:
-                    json_mod.dump(config, f, indent=2, default=str)
-
-                # Spawn sibling container
-                docker_client = docker_sdk.from_env()
-                container_result = docker_client.containers.run(
-                    image=docker_image,
-                    command=[
-                        "python",
-                        "/opt/run_minian.py",
-                        "/data/output/minian_config.json",
-                    ],
-                    volumes={
-                        input_dir_host: {"bind": "/data/input", "mode": "ro"},
-                        output_dir_host: {"bind": "/data/output", "mode": "rw"},
-                    },
-                    mem_limit=container_mem_limit,
-                    environment={
-                        "MINIAN_NWORKERS": str(n_workers),
-                        "MINIAN_MEMORY_LIMIT": memory_limit_env,
-                        "MKL_NUM_THREADS": "1",
-                        "OPENBLAS_NUM_THREADS": "1",
-                        "OMP_NUM_THREADS": "1",
-                    },
-                    remove=True,
-                    detach=False,
-                    stdout=True,
-                    stderr=True,
-                )
-                logger.info(f"Container output:\n{container_result.decode()}")
-
-                # Verify completion marker
-                if (output_dir / ".minian_error").exists():
-                    with open(output_dir / ".minian_error") as f:
-                        err = json_mod.load(f)
-                    raise RuntimeError(
-                        f"Minian container error: {err.get('error')}"
-                    )
-                if not (output_dir / ".minian_complete").exists():
-                    raise RuntimeError(
-                        "Minian container exited without completion marker"
-                    )
-
-                # Load results
-                minian_loader = MinianLoader(str(output_dir))
-                key["processing_time"] = minian_loader.creation_time
-                key["package_version"] = "1.2.1-py38-docker"
-
+                # Collect output files for insertion into DataJoint
                 file_entries = [
                     {
                         **key,
@@ -1072,9 +1017,8 @@ class Processing(dj.Computed):
                     for f in output_dir.rglob("*")
                     if f.is_file()
                 ]
-
-        else:
-            raise ValueError(f"Unknown task mode: {task_mode}")
+            else:
+                raise ValueError(f"Unknown task mode: {task_mode}")
         return (file_entries, output_dir)
 
     def make_insert(self, key, file_entries, output_dir):
@@ -1087,9 +1031,14 @@ class Processing(dj.Computed):
                 ).as_posix(),
             }
         )
-        self.insert1(dict(**key, processing_time=datetime.now(timezone.utc)))
-        # for file in file_entries:
-        #     self.File.insert1(file, ignore_extra_fields=True)
+        self.insert1(
+            dict(
+                **key,
+                processing_time=key.get(
+                    "processing_time", datetime.now(timezone.utc)
+                ),
+            )
+        )
 
 
 # Motion Correction --------------------------------------------------------------------
@@ -1805,10 +1754,22 @@ class MinianLoader:
         Args:
             output_dir: Path to the directory containing Minian zarr outputs.
         """
-        from minian.utilities import open_minian
+        import xarray as xr
 
         self.output_dir = pathlib.Path(output_dir)
-        self._minian_ds = open_minian(str(self.output_dir))
+
+        # Load each zarr variable into a combined Dataset
+        # (replicates what minian's open_minian does without requiring
+        # the minian package to be installed)
+        ds = xr.Dataset()
+        for zarr_path in sorted(self.output_dir.glob("*.zarr")):
+            try:
+                var_ds = xr.open_zarr(str(zarr_path))
+                for name, da in var_ds.data_vars.items():
+                    ds[name] = da
+            except Exception:
+                logger.debug(f"Skipping non-zarr path: {zarr_path}")
+        self._minian_ds = ds
 
         # Load core arrays
         self._A = self._minian_ds.get(
@@ -1996,3 +1957,209 @@ def get_loader_result(key, table, full_output_dir=None) -> tuple:
         raise NotImplementedError("Unknown/unimplemented method: {}".format(method))
 
     return method, loaded_output
+
+
+def _run_minian_in_container(
+    avi_files: list,
+    output_dir: pathlib.Path,
+    params: dict,
+    docker_image: str = MINIAN_DOCKER_IMAGE,
+    timeout: int = MINIAN_DOCKER_TIMEOUT,
+):
+    """
+    Run the minian pipeline inside a Docker container.
+
+    This function:
+    1. Prepares a params.json file
+    2. Identifies the input directory containing the AVI files
+    3. Runs `docker run` with volume mounts for input, output, and params
+    4. Streams container logs to the pipeline logger
+    5. Checks the exit code and status.json for success/failure
+
+    Args:
+        avi_files:    List of paths to AVI video files (must all be in same directory)
+        output_dir:   Path where minian results will be saved
+        params:       Dictionary of minian pipeline parameters
+        docker_image: Docker image to use (default: datajoint/minian-base:0.1.0)
+        timeout:      Max seconds to wait for the container (default: 86400 = 24h)
+
+    Raises:
+        RuntimeError: If the container exits with non-zero code or status.json
+                      reports an error.
+        subprocess.TimeoutExpired: If the container exceeds the timeout.
+    """
+    import json
+    import subprocess
+    import tempfile
+
+    # ── Resolve input directory ──────────────────────────────────────────
+    # All AVI files should be in the same directory (or we use the parent
+    # of the first file). If files are in different directories, we'd need
+    # to copy them — but that's not typical for miniscope recordings.
+    input_dir = pathlib.Path(avi_files[0]).parent.resolve()
+
+    # Verify all files are in the same directory
+    for avi in avi_files:
+        if pathlib.Path(avi).parent.resolve() != input_dir:
+            raise ValueError(
+                f"All AVI files must be in the same directory. "
+                f"Found files in {input_dir} and {pathlib.Path(avi).parent}"
+            )
+
+    # ── Prepare params ───────────────────────────────────────────────────
+    # Write params to a temp directory that will be mounted into the container
+    params_dir = tempfile.mkdtemp(prefix="minian_params_")
+    params_file = os.path.join(params_dir, "params.json")
+
+    # Convert any tuple values to lists for JSON serialization
+    def _serialize_params(obj):
+        if isinstance(obj, tuple):
+            return list(obj)
+        if isinstance(obj, dict):
+            return {k: _serialize_params(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_serialize_params(v) for v in obj]
+        return obj
+
+    serializable_params = _serialize_params(params)
+
+    with open(params_file, "w") as f:
+        json.dump(serializable_params, f, indent=2)
+
+    logger.info(f"Params written to {params_file}")
+
+    # ── Prepare output directory ─────────────────────────────────────────
+    output_dir = pathlib.Path(output_dir).resolve()
+    os.makedirs(output_dir, exist_ok=True)
+
+    # ── Build docker run command ─────────────────────────────────────────
+    #
+    # Volume mounts:
+    #   input_dir  -> /data/input  (read-only: we never modify source videos)
+    #   output_dir -> /data/output (read-write: results written here)
+    #   params_dir -> /data/params (read-only: params.json)
+    #
+    # We also pass through resource-related env vars if set.
+    docker_cmd = [
+        "docker",
+        "run",
+        "--rm",  # Auto-remove container after exit
+        # Volume mounts
+        "-v",
+        f"{input_dir}:/data/input:ro",
+        "-v",
+        f"{output_dir}:/data/output",
+        "-v",
+        f"{params_dir}:/data/params:ro",
+    ]
+
+    # Pass through resource configuration env vars
+    for env_var in ["MINIAN_NWORKERS", "MINIAN_MEMORY_LIMIT"]:
+        val = os.getenv(env_var)
+        if val:
+            docker_cmd.extend(["-e", f"{env_var}={val}"])
+
+    # Memory limit for the container itself (if set)
+    container_memory = os.getenv("MINIAN_CONTAINER_MEMORY")
+    if container_memory:
+        docker_cmd.extend(["--memory", container_memory])
+
+    # CPU limit (if set)
+    container_cpus = os.getenv("MINIAN_CONTAINER_CPUS")
+    if container_cpus:
+        docker_cmd.extend(["--cpus", container_cpus])
+
+    # SHM size — Dask workers need shared memory for inter-process comms
+    docker_cmd.extend(["--shm-size", os.getenv("MINIAN_SHM_SIZE", "8g")])
+
+    # The image
+    docker_cmd.append(docker_image)
+
+    logger.info(f"Docker command: {' '.join(docker_cmd)}")
+
+    # ── Pull image if not present ────────────────────────────────────────
+    try:
+        subprocess.run(
+            ["docker", "image", "inspect", docker_image],
+            capture_output=True,
+            check=True,
+        )
+        logger.info(f"Docker image {docker_image} found locally")
+    except subprocess.CalledProcessError:
+        logger.info(f"Pulling Docker image {docker_image}...")
+        subprocess.run(
+            ["docker", "pull", docker_image],
+            check=True,
+            timeout=600,  # 10 min pull timeout
+        )
+
+    # ── Run the container ────────────────────────────────────────────────
+    logger.info("Starting minian container...")
+    start_time = time.time()
+
+    process = subprocess.Popen(
+        docker_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,  # Line-buffered
+    )
+
+    # Stream container logs to the pipeline logger in real time
+    try:
+        for line in process.stdout:
+            line = line.rstrip()
+            if line:
+                logger.info(f"[minian-container] {line}")
+
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        logger.error(
+            f"Minian container timed out after {timeout}s. Killing..."
+        )
+        process.kill()
+        process.wait()
+        raise RuntimeError(
+            f"Minian container exceeded timeout of {timeout} seconds"
+        )
+
+    elapsed = time.time() - start_time
+    logger.info(
+        f"Container exited with code {process.returncode} "
+        f"after {elapsed:.1f}s ({elapsed/3600:.1f}h)"
+    )
+
+    # ── Check results ────────────────────────────────────────────────────
+    status_file = output_dir / "status.json"
+
+    if process.returncode != 0:
+        error_msg = f"Minian container exited with code {process.returncode}"
+        if status_file.exists():
+            with open(status_file) as f:
+                status = json.load(f)
+            error_msg += f": {status.get('message', 'unknown error')}"
+        raise RuntimeError(error_msg)
+
+    if not status_file.exists():
+        raise RuntimeError(
+            "Minian container exited successfully but no status.json found"
+        )
+
+    with open(status_file) as f:
+        status = json.load(f)
+
+    if status.get("status") != "success":
+        raise RuntimeError(
+            f"Minian container reported failure: {status.get('message', 'unknown')}"
+        )
+
+    logger.info(
+        f"Minian processing complete: {status.get('n_units', '?')} units detected"
+    )
+
+    # ── Cleanup temp params dir ──────────────────────────────────────────
+    import shutil
+
+    shutil.rmtree(params_dir, ignore_errors=True)
+
+    return status
