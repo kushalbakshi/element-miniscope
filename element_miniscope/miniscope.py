@@ -7,6 +7,7 @@ import inspect
 import json
 import os
 import pathlib
+import time
 from datetime import datetime, timezone
 from typing import Union
 
@@ -81,7 +82,7 @@ def activate(
 # Docker image for minian processing.
 # Override with env var MINIAN_DOCKER_IMAGE if using a custom registry.
 MINIAN_DOCKER_IMAGE = os.getenv(
-    "MINIAN_DOCKER_IMAGE", "datajoint/minian-base:0.1.0"
+    "MINIAN_DOCKER_IMAGE", "datajoint/minian-py38:latest"
 )
 
 # Timeout for the docker run command (seconds). Default: 24 hours.
@@ -1966,39 +1967,12 @@ def _run_minian_in_container(
     docker_image: str = MINIAN_DOCKER_IMAGE,
     timeout: int = MINIAN_DOCKER_TIMEOUT,
 ):
-    """
-    Run the minian pipeline inside a Docker container.
-
-    This function:
-    1. Prepares a params.json file
-    2. Identifies the input directory containing the AVI files
-    3. Runs `docker run` with volume mounts for input, output, and params
-    4. Streams container logs to the pipeline logger
-    5. Checks the exit code and status.json for success/failure
-
-    Args:
-        avi_files:    List of paths to AVI video files (must all be in same directory)
-        output_dir:   Path where minian results will be saved
-        params:       Dictionary of minian pipeline parameters
-        docker_image: Docker image to use (default: datajoint/minian-base:0.1.0)
-        timeout:      Max seconds to wait for the container (default: 86400 = 24h)
-
-    Raises:
-        RuntimeError: If the container exits with non-zero code or status.json
-                      reports an error.
-        subprocess.TimeoutExpired: If the container exceeds the timeout.
-    """
     import json
     import subprocess
-    import tempfile
 
     # ── Resolve input directory ──────────────────────────────────────────
-    # All AVI files should be in the same directory (or we use the parent
-    # of the first file). If files are in different directories, we'd need
-    # to copy them — but that's not typical for miniscope recordings.
     input_dir = pathlib.Path(avi_files[0]).parent.resolve()
 
-    # Verify all files are in the same directory
     for avi in avi_files:
         if pathlib.Path(avi).parent.resolve() != input_dir:
             raise ValueError(
@@ -2006,12 +1980,15 @@ def _run_minian_in_container(
                 f"Found files in {input_dir} and {pathlib.Path(avi).parent}"
             )
 
-    # ── Prepare params ───────────────────────────────────────────────────
-    # Write params to a temp directory that will be mounted into the container
-    params_dir = tempfile.mkdtemp(prefix="minian_params_")
-    params_file = os.path.join(params_dir, "params.json")
+    # ── Prepare output directory ─────────────────────────────────────────
+    output_dir = pathlib.Path(output_dir).resolve()
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Convert any tuple values to lists for JSON serialization
+    # ── Prepare params (under output_dir so it's on a shared volume) ─────
+    params_dir = output_dir / ".params"
+    os.makedirs(params_dir, exist_ok=True)
+    params_file = params_dir / "params.json"
+
     def _serialize_params(obj):
         if isinstance(obj, tuple):
             return list(obj)
@@ -2020,37 +1997,43 @@ def _run_minian_in_container(
         if isinstance(obj, list):
             return [_serialize_params(v) for v in obj]
         return obj
-
+    
     serializable_params = _serialize_params(params)
 
+    config = {
+        "input_dir": "/data/input",
+        "output_dir": "/data/output",
+        "params": serializable_params,
+    }
+
     with open(params_file, "w") as f:
-        json.dump(serializable_params, f, indent=2)
+        json.dump(config, f, indent=2)
 
     logger.info(f"Params written to {params_file}")
 
-    # ── Prepare output directory ─────────────────────────────────────────
-    output_dir = pathlib.Path(output_dir).resolve()
-    os.makedirs(output_dir, exist_ok=True)
+    # ── Translate container paths → host paths ───────────────────────────
+    # The host Docker daemon resolves bind-mount paths on the HOST
+    # filesystem, not inside this worker container. We use env vars
+    # set by docker-compose to map container paths to host paths.
+    host_s3_root = os.getenv("HOST_S3_ROOT")
+    host_outbox = os.getenv("HOST_OUTBOX")
+
+    def _to_host_path(container_path, container_prefix, host_prefix):
+        s = str(container_path)
+        if host_prefix and s.startswith(container_prefix):
+            return host_prefix + s[len(container_prefix):]
+        return s  # fallback: use as-is (works if running directly on host)
+
+    host_input_dir = _to_host_path(input_dir, "/home/jovyan/s3", host_s3_root)
+    host_output_dir = _to_host_path(output_dir, "/home/jovyan/efs/outbox", host_outbox)
+    host_params_dir = _to_host_path(params_dir, "/home/jovyan/efs/outbox", host_outbox)
 
     # ── Build docker run command ─────────────────────────────────────────
-    #
-    # Volume mounts:
-    #   input_dir  -> /data/input  (read-only: we never modify source videos)
-    #   output_dir -> /data/output (read-write: results written here)
-    #   params_dir -> /data/params (read-only: params.json)
-    #
-    # We also pass through resource-related env vars if set.
     docker_cmd = [
-        "docker",
-        "run",
-        "--rm",  # Auto-remove container after exit
-        # Volume mounts
-        "-v",
-        f"{input_dir}:/data/input:ro",
-        "-v",
-        f"{output_dir}:/data/output",
-        "-v",
-        f"{params_dir}:/data/params:ro",
+        "docker", "run", "--rm",
+        "-v", f"{host_input_dir}:/data/input:ro",
+        "-v", f"{host_output_dir}:/data/output",
+        "-v", f"{host_params_dir}:/data/params:ro",
     ]
 
     # Pass through resource configuration env vars
@@ -2058,6 +2041,20 @@ def _run_minian_in_container(
         val = os.getenv(env_var)
         if val:
             docker_cmd.extend(["-e", f"{env_var}={val}"])
+
+    # Dask timeout config (prevents worker kills during long computations)
+    dask_env = {
+        "DASK_DISTRIBUTED__SCHEDULER__WORKER_TTL": "3600s",
+        "DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP": "7200s",
+        "DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT": "300s",
+        "DASK_DISTRIBUTED__SCHEDULER__WORK_STEALING": "False",
+    }
+    for key, val in dask_env.items():
+        docker_cmd.extend(["-e", f"{key}={val}"])
+
+    # Memory allocator tuning (reduces heap fragmentation under heavy load)
+    docker_cmd.extend(["-e", "MALLOC_TRIM_THRESHOLD_=131072"])
+    docker_cmd.extend(["-e", "MALLOC_MMAP_THRESHOLD_=131072"])
 
     # Memory limit for the container itself (if set)
     container_memory = os.getenv("MINIAN_CONTAINER_MEMORY")
@@ -2074,6 +2071,7 @@ def _run_minian_in_container(
 
     # The image
     docker_cmd.append(docker_image)
+    docker_cmd.append("/data/params/params.json")
 
     logger.info(f"Docker command: {' '.join(docker_cmd)}")
 
