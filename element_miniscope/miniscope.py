@@ -1788,9 +1788,10 @@ class MinianLoader:
         # Try to load motion correction data
         self._motion = self._minian_ds.get("motion")
 
-        # Try to load reference/max projection images
+        # Summary images
         self._max_proj = self._minian_ds.get("max_proj")
-        self._varr_ref = self._minian_ds.get("varr_ref")
+        self._mean_proj = self._minian_ds.get("mean_proj")
+        self._ref_image = self._minian_ds.get("ref_image")
 
     @property
     def minian_dataset(self):
@@ -1845,16 +1846,15 @@ class MinianLoader:
     @property
     def ref_image(self):
         """Return reference image used for motion correction."""
-        if self._varr_ref is not None:
-            # Take mean across frames for reference
-            return self._varr_ref.mean(dim="frame").compute().values[np.newaxis, :, :]
+        if self._ref_image is not None:
+            return self._ref_image.compute().values[np.newaxis, :, :]
         return None
 
     @property
     def mean_image(self):
         """Return mean image (average across frames)."""
-        if self._varr_ref is not None:
-            return self._varr_ref.mean(dim="frame").compute().values[np.newaxis, :, :]
+        if self._mean_proj is not None:
+            return self._mean_proj.compute().values[np.newaxis, :, :]
         return None
 
     @property
@@ -1862,8 +1862,6 @@ class MinianLoader:
         """Return maximum projection image."""
         if self._max_proj is not None:
             return self._max_proj.compute().values[np.newaxis, :, :]
-        elif self._varr_ref is not None:
-            return self._varr_ref.max(dim="frame").compute().values[np.newaxis, :, :]
         return None
 
     @property
@@ -2036,28 +2034,31 @@ def _run_minian_in_container(
         "-v", f"{host_params_dir}:/data/params:ro",
     ]
 
-    # Pass through resource configuration env vars
-    for env_var in ["MINIAN_NWORKERS", "MINIAN_MEMORY_LIMIT"]:
+    # Pass through resource configuration and Dask env vars
+    _passthrough_env_vars = [
+        "MINIAN_NWORKERS",
+        "MINIAN_MEMORY_LIMIT",
+        # Dask distributed config (set via docker-compose with defaults)
+        "DASK_DISTRIBUTED__SCHEDULER__WORKER_TTL",
+        "DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP",
+        "DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT",
+        "DASK_DISTRIBUTED__SCHEDULER__WORK_STEALING",
+        "DASK_DISTRIBUTED__WORKER__MEMORY__TARGET",
+        "DASK_DISTRIBUTED__WORKER__MEMORY__SPILL",
+        "DASK_DISTRIBUTED__WORKER__MEMORY__PAUSE",
+        "DASK_DISTRIBUTED__WORKER__MEMORY__TERMINATE",
+    ]
+    for env_var in _passthrough_env_vars:
         val = os.getenv(env_var)
         if val:
             docker_cmd.extend(["-e", f"{env_var}={val}"])
-
-    # Dask timeout config (prevents worker kills during long computations)
-    dask_env = {
-        "DASK_DISTRIBUTED__SCHEDULER__WORKER_TTL": "3600s",
-        "DASK_DISTRIBUTED__COMM__TIMEOUTS__TCP": "7200s",
-        "DASK_DISTRIBUTED__COMM__TIMEOUTS__CONNECT": "300s",
-        "DASK_DISTRIBUTED__SCHEDULER__WORK_STEALING": "False",
-    }
-    for key, val in dask_env.items():
-        docker_cmd.extend(["-e", f"{key}={val}"])
 
     # Memory allocator tuning (reduces heap fragmentation under heavy load)
     docker_cmd.extend(["-e", "MALLOC_TRIM_THRESHOLD_=131072"])
     docker_cmd.extend(["-e", "MALLOC_MMAP_THRESHOLD_=131072"])
 
     # Memory limit for the container itself (if set)
-    container_memory = os.getenv("MINIAN_CONTAINER_MEMORY")
+    container_memory = os.getenv("MINIAN_CONTAINER_MEM_LIMIT")
     if container_memory:
         docker_cmd.extend(["--memory", container_memory])
 
@@ -2071,7 +2072,6 @@ def _run_minian_in_container(
 
     # The image
     docker_cmd.append(docker_image)
-    docker_cmd.append("/data/params/params.json")
 
     logger.info(f"Docker command: {' '.join(docker_cmd)}")
 
